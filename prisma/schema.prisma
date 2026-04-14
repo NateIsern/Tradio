@@ -10,25 +10,24 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "mongodb"
   url      = env("DATABASE_URL")
 }
 
 model Models {
-  id                   String   @id @default(uuid())
+  id                   String   @id @default(auto()) @map("_id") @db.ObjectId
   name                 String   @unique
-  openRoutermodelName            String
+  openRoutermodelName  String
   lighterApiKey        String
   invocationCount      Int      @default(0)
   invocations          Invocations[]
   portfolioSize        PortfolioSize[]
-  accountIndex         String      
-  @@index([name])
+  accountIndex         String
 }
 
 model Invocations {
-  id                   String   @id @default(uuid())
-  modelId              String
+  id                   String   @id @default(auto()) @map("_id") @db.ObjectId
+  modelId              String   @db.ObjectId
   response             String
   model                Models   @relation(fields: [modelId], references: [id])
   toolCalls            ToolCalls[]
@@ -39,8 +38,8 @@ model Invocations {
 }
 
 model ToolCalls {
-  id                   String   @id @default(uuid())
-  invocationId         String
+  id                   String   @id @default(auto()) @map("_id") @db.ObjectId
+  invocationId         String   @db.ObjectId
   toolCallType         ToolCallType
   metadata             String
   invocation           Invocations   @relation(fields: [invocationId], references: [id])
@@ -51,8 +50,8 @@ model ToolCalls {
 }
 
 model PortfolioSize {
-  id                   String   @id @default(uuid())
-  modelId              String
+  id                   String   @id @default(auto()) @map("_id") @db.ObjectId
+  modelId              String   @db.ObjectId
   netPortfolio         String
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt

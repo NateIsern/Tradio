@@ -1,47 +1,47 @@
-import { API_KEY_INDEX, BASE_URL } from "./config";
-import { NonceManagerType } from "./lighter-sdk-ts/nonce_manager";
-import { SignerClient } from "./lighter-sdk-ts/signer";
+import { execSync } from "child_process";
 import type { Account } from "./accounts";
+import { BASE_URL } from "./config";
 import { MARKETS } from "./markets";
 import { getOpenPositions } from "./openPositions";
-import { CandlestickApi, IsomorphicFetchHttpLibrary, ServerConfiguration } from "./lighter-sdk-ts/generated";
+import { getAuthToken, fetchH2 } from "./auth";
+
+function getLatestPrice(marketId: number): number {
+    const token = getAuthToken();
+    const now = Date.now();
+    const url = `${BASE_URL}/api/v1/candles?market_id=${marketId}&resolution=1m&start_timestamp=${now - 300000}&end_timestamp=${now}&count_back=1`;
+    const body = fetchH2(url, token);
+    const data = JSON.parse(body) as { c: Array<{ c: number }> };
+    const price = data.c[data.c.length - 1]?.c;
+    if (!price) throw new Error("No latest price found");
+    return price;
+}
 
 export async function cancelAllOrders(account: Account) {
-    const client = await SignerClient.create({
-        url: BASE_URL,
-        privateKey: account.apiKey,
-        apiKeyIndex: API_KEY_INDEX,
-        accountIndex: Number(account.accountIndex),
-        nonceManagementType: NonceManagerType.API
-    });
-    const candleStickApi = new CandlestickApi({
-        baseServer: new ServerConfiguration<{  }>(BASE_URL, {  }),
-        httpApi: new IsomorphicFetchHttpLibrary(),
-        middleware: [],
-        authMethods: {}
-    }); 
     const openPositions = await getOpenPositions(account.apiKey, account.accountIndex);
-    openPositions?.forEach(async ({position, sign, symbol}) => {
-        if (Number(position) != 0) {
-            const candleStickData = await candleStickApi.candlesticks(MARKETS[symbol as keyof typeof MARKETS].marketId, '1m', Date.now() - 1000 * 60 * 5, Date.now(), 1, false);
-            const latestPrice = candleStickData.candlesticks[candleStickData.candlesticks.length - 1]?.close;
-            if (!latestPrice) {
-                throw new Error("No latest price found");
-            }
-            sign = sign == "LONG" ? "SHORT" : "LONG";
-            // create opposite order to close the position
-            await client.createOrder({
-                marketIndex: MARKETS[symbol as keyof typeof MARKETS].marketId,
-                clientOrderIndex: MARKETS[symbol as keyof typeof MARKETS].clientOrderIndex,
-                baseAmount: Math.abs(Number(position)) * MARKETS[symbol as keyof typeof MARKETS].qtyDecimals,
-                price: (sign == "LONG" ? latestPrice * 1.01 : latestPrice * 0.99) * MARKETS[symbol as keyof typeof MARKETS].priceDecimals,
-                isAsk: sign === "LONG" ? false : true,
-                orderType: SignerClient.ORDER_TYPE_MARKET,
-                timeInForce: SignerClient.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-                reduceOnly: 0,
-                triggerPrice: SignerClient.NIL_TRIGGER_PRICE,
-                orderExpiry: SignerClient.DEFAULT_IOC_EXPIRY,
-            });
-        }
-    });
+    if (!openPositions?.length) return;
+
+    const positionsData = openPositions
+        .filter(p => Number(p.position) !== 0)
+        .map(p => {
+            const market = MARKETS[p.symbol as keyof typeof MARKETS];
+            return {
+                symbol: p.symbol,
+                position: p.position,
+                sign: p.sign,
+                marketId: market.marketId,
+                clientOrderIndex: market.clientOrderIndex,
+                qtyDecimals: market.qtyDecimals,
+                priceDecimals: market.priceDecimals,
+                latestPrice: getLatestPrice(market.marketId),
+            };
+        });
+
+    if (positionsData.length === 0) return;
+
+    const result = execSync(
+        `python3 trade.py close_all '${JSON.stringify(positionsData)}' `,
+        { cwd: import.meta.dir, env: process.env },
+    ).toString().trim();
+
+    console.log("Close all result:", result);
 }

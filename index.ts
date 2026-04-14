@@ -1,6 +1,5 @@
-import { createOpenRouter } from '@openrouter/ai-sdk-provider';
-import { streamText } from 'ai';
-import { int, z } from 'zod';
+import { z } from 'zod';
+import { execSync } from 'child_process';
 import { PROMPT } from './prompt';
 import { type Account } from './accounts';
 import { getIndicators } from './stockData';
@@ -12,10 +11,20 @@ import { PrismaClient, ToolCallType } from './generated/prisma/client';
 import { getPortfolio } from './getPortfolio';
 const prisma = new PrismaClient();
 
+interface ChatMessage { role: string; content: string }
+interface ToolCall { id: string; type: string; function: { name: string; arguments: string } }
+interface ChatChoice { message: { content: string | null; tool_calls?: ToolCall[] }; finish_reason: string }
+
+function callDOChat(model: string, messages: ChatMessage[], tools: object[]): ChatChoice {
+  const body = JSON.stringify({ model, messages, tools, max_completion_tokens: 2048 });
+  const resp = execSync(
+    `curl -s --http2 --max-time 120 -X POST "https://inference.do-ai.run/v1/chat/completions" -H "Authorization: Bearer ${process.env['DO_MODEL_ACCESS_KEY']}" -H "Content-Type: application/json" -d '${body.replace(/'/g, "'\\''")}'`,
+  ).toString();
+  const data = JSON.parse(resp) as { choices: ChatChoice[] };
+  return data.choices[0]!;
+}
+
 export const invokeAgent = async (account: Account) => {
-  const openrouter = createOpenRouter({
-    apiKey: process.env['OPENROUTER_API_KEY'] ?? '',
-  });
 
   let ALL_INDICATOR_DATA = "";
   const indicators = await Promise.all(Object.keys(MARKETS).map(async marketSlug => {
@@ -54,62 +63,71 @@ export const invokeAgent = async (account: Account) => {
   .replace("{{CURRENT_ACCOUNT_VALUE}}", `$${portfolio.total}`)
   .replace("{{CURRENT_ACCOUNT_POSITIONS}}", JSON.stringify(openPositions))
 
-  console.log(enrichedPrompt)
+  console.log("Calling AI model:", account.modelName);
 
-  const response = streamText({
-    model: openrouter(account.modelName),
-    prompt: enrichedPrompt,
-    tools: {
-      createPosition: {
-        description: 'Open a position in the given market',
-        inputSchema: z.object({
-          symbol: z.enum(Object.keys(MARKETS)).describe('The symbol to open the position at'),
-          side: z.enum(["LONG", "SHORT"]),
-          quantity: z.number().describe('The quantity of the position to open.'),
-        }),
-        execute: async ({ symbol, side, quantity }) => {
-          // Do the opposite of what the AI infers
-          side = side === "LONG" ? "SHORT" : "LONG";
-          await createPosition(account, symbol, side, quantity);
-          await prisma.toolCalls.create({
-            data: {
-              invocationId: modelInvocation.id,
-              toolCallType: ToolCallType.CREATE_POSITION,
-              metadata: JSON.stringify({ symbol, side, quantity }),
-            },
-          });
-          return `Position opened successfully for ${quantity} ${symbol}`;
-        },
-      },
-      closeAllPosition: {
-        description: 'Close all the currently open positions',
-        inputSchema: z.object({}),
-        execute: async () => {
-          await cancelAllOrders(account);
-          await prisma.toolCalls.create({
-            data: {
-              invocationId: modelInvocation.id,
-              toolCallType: ToolCallType.CLOSE_POSITION,
-              metadata: "",
-            },
-          });
-          console.log(`All positions closed successfully`);
-          return `All positions closed successfully`;
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "createPosition",
+        description: "Open a position in the given market",
+        parameters: {
+          type: "object",
+          properties: {
+            symbol: { type: "string", enum: Object.keys(MARKETS), description: "The symbol to open the position at" },
+            side: { type: "string", enum: ["LONG", "SHORT"] },
+            quantity: { type: "number", description: "The quantity of the position to open" },
+          },
+          required: ["symbol", "side", "quantity"],
         },
       },
     },
-  });
+    {
+      type: "function",
+      function: {
+        name: "closeAllPosition",
+        description: "Close all the currently open positions",
+        parameters: { type: "object", properties: {} },
+      },
+    },
+  ];
 
-  await response.consumeStream();
+  const choice = callDOChat(account.modelName, [{ role: "user", content: enrichedPrompt }], tools);
+  let responseText = choice.message.content ?? "";
+
+  if (choice.message.tool_calls) {
+    for (const tc of choice.message.tool_calls) {
+      const args = JSON.parse(tc.function.arguments);
+      if (tc.function.name === "createPosition") {
+        let side = args.side as "LONG" | "SHORT";
+        // Do the opposite of what the AI infers
+        side = side === "LONG" ? "SHORT" : "LONG";
+        await createPosition(account, args.symbol, side, args.quantity);
+        await prisma.toolCalls.create({
+          data: { invocationId: modelInvocation.id, toolCallType: ToolCallType.CREATE_POSITION, metadata: JSON.stringify({ ...args, side }) },
+        });
+        responseText += ` [Created ${side} ${args.quantity} ${args.symbol}]`;
+      } else if (tc.function.name === "closeAllPosition") {
+        await cancelAllOrders(account);
+        await prisma.toolCalls.create({
+          data: { invocationId: modelInvocation.id, toolCallType: ToolCallType.CLOSE_POSITION, metadata: "" },
+        });
+        responseText += " [Closed all positions]";
+      }
+    }
+  }
+
+  console.log("AI response:", responseText);
+
   await prisma.models.update({
     where: { id: account.id },
     data: { invocationCount: { increment: 1 } },
   });
   await prisma.invocations.update({
     where: { id: modelInvocation.id },
-    data: { response: (await response.text).trim() },
+    data: { response: responseText.trim() },
   });
-  return response.text;
+  return responseText;
 };
 
 async function main() {

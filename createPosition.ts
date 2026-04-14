@@ -1,43 +1,33 @@
-import { NonceManagerType } from "./lighter-sdk-ts/nonce_manager";
-import { SignerClient } from "./lighter-sdk-ts/signer";
-import { AccountApi, ApiKeyAuthentication, IsomorphicFetchHttpLibrary, OrderApi, ServerConfiguration } from "./lighter-sdk-ts/generated";
+import { execSync } from "child_process";
 import type { Account } from "./accounts";
-import { API_KEY_INDEX, BASE_URL } from "./config";
+import { BASE_URL } from "./config";
 import { MARKETS } from "./markets";
-import { CandlestickApi, MarketInfo } from "./lighter-sdk-ts/generated";
+import { getAuthToken, fetchH2 } from "./auth";
+
+function getLatestPrice(marketId: number): number {
+    const token = getAuthToken();
+    const now = Date.now();
+    const url = `${BASE_URL}/api/v1/candles?market_id=${marketId}&resolution=1m&start_timestamp=${now - 300000}&end_timestamp=${now}&count_back=1`;
+    const body = fetchH2(url, token);
+    const data = JSON.parse(body) as { c: Array<{ c: number }> };
+    const price = data.c[data.c.length - 1]?.c;
+    if (!price) throw new Error("No latest price found");
+    return price;
+}
 
 export async function createPosition(account: Account, symbol: string, side: "LONG" | "SHORT", quantity: number) {
-    const client = await SignerClient.create({
-        url: BASE_URL,
-        privateKey: account.apiKey,
-        apiKeyIndex: API_KEY_INDEX,
-        accountIndex: Number(account.accountIndex),
-        nonceManagementType: NonceManagerType.API
-    });
-
     const market = MARKETS[symbol as keyof typeof MARKETS];
-    const candleStickApi = new CandlestickApi({
-        baseServer: new ServerConfiguration<{  }>(BASE_URL, {  }),
-        httpApi: new IsomorphicFetchHttpLibrary(),
-        middleware: [],
-        authMethods: {}
-    }); 
-    const candleStickData = await candleStickApi.candlesticks(market.marketId, '1m', Date.now() - 1000 * 60 * 5, Date.now(), 1, false);
-    const latestPrice = candleStickData.candlesticks[candleStickData.candlesticks.length - 1]?.close;
-    if (!latestPrice) {
-        throw new Error("No latest price found");
-    }
-    const response = await client.createOrder({
-        marketIndex: market.marketId,
-        clientOrderIndex: market.clientOrderIndex,
-        baseAmount: quantity * market.qtyDecimals,
-        price: (side == "LONG" ? latestPrice * 1.01 : latestPrice * 0.99) * market.priceDecimals,
-        isAsk: side == "LONG" ? false : true,
-        orderType: SignerClient.ORDER_TYPE_MARKET,
-        timeInForce: SignerClient.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-        reduceOnly: 0,
-        triggerPrice: SignerClient.NIL_TRIGGER_PRICE,
-        orderExpiry: SignerClient.DEFAULT_IOC_EXPIRY,
-    });
-    console.log(response);
+    const latestPrice = getLatestPrice(market.marketId);
+    const price = Math.round((side === "LONG" ? latestPrice * 1.01 : latestPrice * 0.99) * market.priceDecimals);
+    const baseAmount = Math.round(quantity * market.qtyDecimals);
+    const isAsk = side === "LONG" ? "false" : "true";
+
+    const result = execSync(
+        `python3 trade.py create_order ${market.marketId} ${market.clientOrderIndex} ${baseAmount} ${price} ${isAsk} `,
+        { cwd: import.meta.dir, env: process.env },
+    ).toString().trim();
+
+    const parsed = JSON.parse(result);
+    if (parsed.error) throw new Error(`Trade failed: ${parsed.error}`);
+    console.log(`Order placed: ${symbol} ${side} qty=${quantity} tx=${parsed.tx_hash}`);
 }

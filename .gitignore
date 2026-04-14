@@ -34,3 +34,7 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .DS_Store
 
 /generated/prisma
+generated/
+lighter-sdk-ts/signers/*.so
+lighter-sdk-ts/signers/*.dylib
+lighter-sdk-ts/signers/*.dll

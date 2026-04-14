@@ -53,6 +53,8 @@ function initializeSigner(): SignerLibrary {
     if (platform === 'darwin' && arch === 'arm64') {
         console.log("macOS");
         libPath = path.join(signerPath, 'signer-arm64.dylib');
+    } else if (platform === 'linux' && arch === 'arm64') {
+        libPath = path.join(signerPath, 'signer-arm64.so');
     } else if (platform === 'linux' && (arch === 'x64' || arch === 'x86_64')) {
         libPath = path.join(signerPath, 'signer-amd64.so');
     } else if (platform === 'win32' && (arch === 'x64' || arch === 'x86_64')) {

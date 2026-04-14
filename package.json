@@ -4,18 +4,22 @@
   "type": "module",
   "private": true,
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "mongodb": "^7.1.1"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
+    "@ai-sdk/openai": "2",
     "@openrouter/ai-sdk-provider": "^1.2.0",
     "@prisma/client": "^6.18.0",
     "ai": "^5.0.81",
+    "axios": "^1.15.0",
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "prisma": "^6.18.0",
-    "recharts": "^3.3.0"
+    "recharts": "^3.3.0",
+    "whatwg-fetch": "^3.6.20"
   }
 }
