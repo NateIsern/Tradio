@@ -39,7 +39,77 @@ export function getMacd(prices: number[]) {
 
     ema12 = ema12.slice(-ema26.length);
 
-    console.log(ema12.length, ema26.length);
     const macd = ema12.map((_, index) => (ema12[index] ?? 0) - (ema26[index] ?? 0));
     return macd
+}
+
+export function getRSI(prices: number[], period: number = 14): number[] {
+    if (prices.length < period + 1) {
+        return [];
+    }
+
+    const gains: number[] = [];
+    const losses: number[] = [];
+    for (let i = 1; i < prices.length; i++) {
+        const change = (prices[i] ?? 0) - (prices[i - 1] ?? 0);
+        gains.push(change > 0 ? change : 0);
+        losses.push(change < 0 ? -change : 0);
+    }
+
+    let avgGain = 0;
+    let avgLoss = 0;
+    for (let i = 0; i < period; i++) {
+        avgGain += gains[i] ?? 0;
+        avgLoss += losses[i] ?? 0;
+    }
+    avgGain /= period;
+    avgLoss /= period;
+
+    const rsiValues: number[] = [];
+    const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+    rsiValues.push(100 - 100 / (1 + rs));
+
+    for (let i = period; i < gains.length; i++) {
+        avgGain = (avgGain * (period - 1) + (gains[i] ?? 0)) / period;
+        avgLoss = (avgLoss * (period - 1) + (losses[i] ?? 0)) / period;
+        const currentRs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+        rsiValues.push(100 - 100 / (1 + currentRs));
+    }
+
+    return rsiValues;
+}
+
+export function getBollingerBands(
+    prices: number[],
+    period: number = 20,
+    stdDevMultiplier: number = 2,
+): { upper: number[]; middle: number[]; lower: number[] } {
+    if (prices.length < period) {
+        return { upper: [], middle: [], lower: [] };
+    }
+
+    const upper: number[] = [];
+    const middle: number[] = [];
+    const lower: number[] = [];
+
+    for (let i = period - 1; i < prices.length; i++) {
+        let sum = 0;
+        for (let j = i - period + 1; j <= i; j++) {
+            sum += prices[j] ?? 0;
+        }
+        const sma = sum / period;
+
+        let varianceSum = 0;
+        for (let j = i - period + 1; j <= i; j++) {
+            const diff = (prices[j] ?? 0) - sma;
+            varianceSum += diff * diff;
+        }
+        const stdDev = Math.sqrt(varianceSum / period);
+
+        middle.push(sma);
+        upper.push(sma + stdDevMultiplier * stdDev);
+        lower.push(sma - stdDevMultiplier * stdDev);
+    }
+
+    return { upper, middle, lower };
 }

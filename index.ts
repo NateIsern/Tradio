@@ -1,4 +1,3 @@
-import { z } from 'zod';
 import { execSync } from 'child_process';
 import { writeFileSync, unlinkSync } from 'fs';
 import { PROMPT } from './prompt';
@@ -16,6 +15,12 @@ interface ChatMessage { role: string; content: string }
 interface ToolCall { id: string; type: string; function: { name: string; arguments: string } }
 interface ChatChoice { message: { content: string | null; tool_calls?: ToolCall[] }; finish_reason: string }
 
+const MARKET_LEVERAGE: Record<string, number> = {
+  ZEC: 5,
+  HYPE: 10,
+  SOL: 10,
+};
+
 function callDOChat(model: string, messages: ChatMessage[], tools: object[]): ChatChoice {
   const body = JSON.stringify({ model, messages, tools, max_completion_tokens: 2048 });
   const tmpFile = "/tmp/tradio-request.json";
@@ -32,21 +37,30 @@ function callDOChat(model: string, messages: ChatMessage[], tools: object[]): Ch
 export const invokeAgent = async (account: Account) => {
 
   let ALL_INDICATOR_DATA = "";
-  const indicators = await Promise.all(Object.keys(MARKETS).map(async marketSlug => {
+  const marketSlugs = Object.keys(MARKETS) as Array<keyof typeof MARKETS>;
+  await Promise.all(marketSlugs.map(async (marketSlug) => {
     const intradayIndicators = await getIndicators("5m", MARKETS[marketSlug].marketId);
     const longTermIndicators = await getIndicators("4h", MARKETS[marketSlug].marketId);
-    
+
     ALL_INDICATOR_DATA = ALL_INDICATOR_DATA + `
     MARKET - ${marketSlug}
     Intraday (5m candles) (oldest → latest):
     Mid prices - [${intradayIndicators.midPrices.join(",")}]
     EMA20 - [${intradayIndicators.ema20s.join(",")}]
     MACD - [${intradayIndicators.macd.join(",")}]
+    RSI - [${intradayIndicators.rsi.join(",")}]
+    Bollinger Upper - [${intradayIndicators.bollingerBands.upper.join(",")}]
+    Bollinger Middle - [${intradayIndicators.bollingerBands.middle.join(",")}]
+    Bollinger Lower - [${intradayIndicators.bollingerBands.lower.join(",")}]
 
     Long Term (4h candles) (oldest → latest):
     Mid prices - [${longTermIndicators.midPrices.join(",")}]
     EMA20 - [${longTermIndicators.ema20s.join(",")}]
     MACD - [${longTermIndicators.macd.join(",")}]
+    RSI - [${longTermIndicators.rsi.join(",")}]
+    Bollinger Upper - [${longTermIndicators.bollingerBands.upper.join(",")}]
+    Bollinger Middle - [${longTermIndicators.bollingerBands.middle.join(",")}]
+    Bollinger Lower - [${longTermIndicators.bollingerBands.lower.join(",")}]
 
     `
   }))
@@ -60,13 +74,40 @@ export const invokeAgent = async (account: Account) => {
       response: "",
     },
   });
+  const recentInvocations = await prisma.invocations.findMany({
+    where: { modelId: account.id },
+    orderBy: { createdAt: "desc" },
+    take: 10,
+    include: { toolCalls: true },
+  });
+  const tradeHistory = recentInvocations.length === 0
+    ? "No previous trades."
+    : recentInvocations
+        .reverse()
+        .map((inv) => {
+          const actions = inv.toolCalls.length === 0
+            ? "No action taken"
+            : inv.toolCalls.map((tc) => {
+                if (tc.toolCallType === "CREATE_POSITION" && tc.metadata) {
+                  const meta = JSON.parse(tc.metadata) as { symbol: string; side: string; quantity: number };
+                  return `Opened ${meta.side} ${meta.quantity} ${meta.symbol}`;
+                }
+                return "Closed all positions";
+              }).join("; ");
+          const timestamp = inv.createdAt.toISOString().slice(0, 16).replace("T", " ");
+          const summary = inv.response.length > 120 ? inv.response.slice(0, 120) + "..." : inv.response;
+          return `[${timestamp}] ${actions} | ${summary}`;
+        })
+        .join("\n");
+
   const enrichedPrompt = PROMPT.replace("{{INVOKATION_TIMES}}", account.invocationCount.toString())
   .replace("{{OPEN_POSITIONS}}", openPositions?.map((position) => `${position.symbol} ${position.position} ${position.sign}`).join(", ") ?? "")
-  .replace("{{PORTFOLIO_VALUE}}", `$${portfolio.total}`)
+  .replace("{{PORTFOLIO_VALUE}}", portfolio.total)
   .replace("{{ALL_INDICATOR_DATA}}", ALL_INDICATOR_DATA)
-  .replace("{{AVAILABLE_CASH}}", `$${portfolio.available}`)
-  .replace("{{CURRENT_ACCOUNT_VALUE}}", `$${portfolio.total}`)
+  .replace("{{AVAILABLE_CASH}}", portfolio.available)
+  .replace("{{CURRENT_ACCOUNT_VALUE}}", portfolio.total)
   .replace("{{CURRENT_ACCOUNT_POSITIONS}}", JSON.stringify(openPositions))
+  .replace("{{TRADE_HISTORY}}", tradeHistory)
 
   console.log("Calling AI model:", account.modelName);
 
@@ -104,14 +145,18 @@ export const invokeAgent = async (account: Account) => {
     for (const tc of choice.message.tool_calls) {
       const args = JSON.parse(tc.function.arguments);
       if (tc.function.name === "createPosition") {
-        let side = args.side as "LONG" | "SHORT";
-        // Do the opposite of what the AI infers
-        side = side === "LONG" ? "SHORT" : "LONG";
-        await createPosition(account, args.symbol, side, args.quantity);
+        const side = args.side as "LONG" | "SHORT";
+        const symbol = args.symbol as string;
+        const leverage = MARKET_LEVERAGE[symbol] ?? 5;
+        const availableBalance = parseFloat(portfolio.available);
+        const riskAmount = availableBalance * 0.02;
+        const quantity = Number((riskAmount * leverage).toFixed(2));
+
+        await createPosition(account, symbol, side, quantity);
         await prisma.toolCalls.create({
-          data: { invocationId: modelInvocation.id, toolCallType: ToolCallType.CREATE_POSITION, metadata: JSON.stringify({ ...args, side }) },
+          data: { invocationId: modelInvocation.id, toolCallType: ToolCallType.CREATE_POSITION, metadata: JSON.stringify({ symbol, side, quantity }) },
         });
-        responseText += ` [Created ${side} ${args.quantity} ${args.symbol}]`;
+        responseText += ` [Created ${side} ${quantity} ${symbol} (2% risk, ${leverage}x leverage)]`;
       } else if (tc.function.name === "closeAllPosition") {
         await cancelAllOrders(account);
         await prisma.toolCalls.create({

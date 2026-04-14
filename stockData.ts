@@ -1,4 +1,4 @@
-import { getEma, getMacd } from "./indicators";
+import { getEma, getMacd, getRSI, getBollingerBands } from "./indicators";
 import { getAuthToken, fetchH2 } from "./auth";
 import { BASE_URL } from "./config";
 
@@ -28,7 +28,15 @@ function getMidPrices(candles: CandleRaw[]): number[] {
     return candles.map(c => Number(((c.o + c.c) / 2).toFixed(3)));
 }
 
-export async function getIndicators(duration: "5m" | "4h", marketId: number): Promise<{ midPrices: number[], macd: number[], ema20s: number[] }> {
+interface IndicatorResult {
+    midPrices: number[];
+    macd: number[];
+    ema20s: number[];
+    rsi: number[];
+    bollingerBands: { upper: number[]; middle: number[]; lower: number[] };
+}
+
+export async function getIndicators(duration: "5m" | "4h", marketId: number): Promise<IndicatorResult> {
     const candles = fetchCandles(marketId, duration, 50);
     const midPrices = getMidPrices(candles);
 
@@ -37,15 +45,25 @@ export async function getIndicators(duration: "5m" | "4h", marketId: number): Pr
             midPrices: midPrices.slice(-10).map(x => Number(x.toFixed(3))),
             macd: [],
             ema20s: [],
+            rsi: [],
+            bollingerBands: { upper: [], middle: [], lower: [] },
         };
     }
 
-    const macd = getMacd(midPrices).slice(-10);
+    const macd = getMacd(midPrices);
     const ema20s = getEma(midPrices, 20);
+    const rsi = getRSI(midPrices, 14);
+    const bb = getBollingerBands(midPrices, 20, 2);
 
     return {
         midPrices: midPrices.slice(-10).map(x => Number(x.toFixed(3))),
         macd: macd.slice(-10).map(x => Number(x.toFixed(3))),
         ema20s: ema20s.slice(-10).map(x => Number(x.toFixed(3))),
+        rsi: rsi.slice(-10).map(x => Number(x.toFixed(1))),
+        bollingerBands: {
+            upper: bb.upper.slice(-10).map(x => Number(x.toFixed(3))),
+            middle: bb.middle.slice(-10).map(x => Number(x.toFixed(3))),
+            lower: bb.lower.slice(-10).map(x => Number(x.toFixed(3))),
+        },
     };
 }
