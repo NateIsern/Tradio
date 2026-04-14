@@ -70,13 +70,18 @@ export default function PerformanceChart({ data }: Props) {
   }, [data]);
 
   return (
-    <div className="relative w-full flex flex-1 border-r-2 border-black">
+    <div className="relative w-full flex flex-1 border-r-2 border-black" style={{ minHeight: 300 }}>
       {/* Title */}
       <div className="absolute left-1/2 top-2 -translate-x-1/2 z-10">
         <h2 className="text-sm font-bold text-black font-mono">TOTAL ACCOUNT VALUE</h2>
       </div>
 
-      <ResponsiveContainer width="100%" height="100%">
+      {chartData.length === 0 ? (
+        <div className="flex items-center justify-center w-full h-full text-gray-400 font-mono text-sm">
+          Waiting for data... bot runs every 5 min
+        </div>
+      ) : (
+      <ResponsiveContainer width="100%" height="100%" minHeight={300}>
         <LineChart
           data={chartData}
           margin={{ top: 40, right: 80, bottom: 0, left: 20 }}
@@ -103,7 +108,7 @@ export default function PerformanceChart({ data }: Props) {
           <YAxis
             tick={{ fontSize: 12, fontFamily: 'Courier New, monospace', fontWeight: 600, fill: 'rgba(0, 0, 0, 0.8)' }}
             tickFormatter={(v: number) => `$${v.toLocaleString()}`}
-            ticks={[500, 1000, 1500]}
+            domain={['auto', 'auto']}
             stroke="rgba(0, 0, 0, 0.4)"
             strokeWidth={1.5}
           />
@@ -148,6 +153,7 @@ export default function PerformanceChart({ data }: Props) {
           ))}
         </LineChart>
       </ResponsiveContainer>
+      )}
     </div>
   );
 }

@@ -4,7 +4,7 @@ export default function Navbar() {
       <div className="mx-auto max-w-[95vw] px-2">
         <div className="flex h-10 md:h-14 items-center justify-between font-bold">
           <div className="flex items-center">
-            <a href="/">ALPHA ARENA
+            <a href="/">TRADIO
               {/* <img
                 src="/logos/alpha_logo.png"
                 alt="Alpha Arena"

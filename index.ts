@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { execSync } from 'child_process';
+import { writeFileSync, unlinkSync } from 'fs';
 import { PROMPT } from './prompt';
 import { type Account } from './accounts';
 import { getIndicators } from './stockData';
@@ -17,10 +18,14 @@ interface ChatChoice { message: { content: string | null; tool_calls?: ToolCall[
 
 function callDOChat(model: string, messages: ChatMessage[], tools: object[]): ChatChoice {
   const body = JSON.stringify({ model, messages, tools, max_completion_tokens: 2048 });
+  const tmpFile = "/tmp/tradio-request.json";
+  writeFileSync(tmpFile, body);
   const resp = execSync(
-    `curl -s --http2 --max-time 120 -X POST "https://inference.do-ai.run/v1/chat/completions" -H "Authorization: Bearer ${process.env['DO_MODEL_ACCESS_KEY']}" -H "Content-Type: application/json" -d '${body.replace(/'/g, "'\\''")}'`,
+    `curl -s --http2 --max-time 120 -X POST "https://inference.do-ai.run/v1/chat/completions" -H "Authorization: Bearer ${process.env['DO_MODEL_ACCESS_KEY']}" -H "Content-Type: application/json" -d @${tmpFile}`,
   ).toString();
-  const data = JSON.parse(resp) as { choices: ChatChoice[] };
+  try { unlinkSync(tmpFile); } catch {}
+  const data = JSON.parse(resp) as { choices: ChatChoice[]; error?: { message: string } };
+  if (data.error) throw new Error(`DO API error: ${data.error.message}`);
   return data.choices[0]!;
 }
 
@@ -131,22 +136,35 @@ export const invokeAgent = async (account: Account) => {
 };
 
 async function main() {
+    console.log(`[${new Date().toLocaleTimeString()}] Starting trading cycle...`);
     const models = await prisma.models.findMany();
 
     for (const model of models) {
-        await invokeAgent({
-            apiKey: model.lighterApiKey,
-            modelName: model.openRoutermodelName,
-            name: model.name,
-            invocationCount: model.invocationCount,
-            id: model.id,
-            accountIndex: model.accountIndex
-        });
+        try {
+            const account: Account = {
+                apiKey: model.lighterApiKey,
+                modelName: model.openRoutermodelName,
+                name: model.name,
+                invocationCount: model.invocationCount,
+                id: model.id,
+                accountIndex: model.accountIndex,
+            };
+            await invokeAgent(account);
+
+            const portfolio = await getPortfolio(account);
+            await prisma.portfolioSize.create({
+                data: {
+                    modelId: model.id,
+                    netPortfolio: portfolio.total,
+                },
+            });
+            console.log(`[${new Date().toLocaleTimeString()}] Portfolio: $${portfolio.total}`);
+        } catch (err) {
+            console.error(`[${new Date().toLocaleTimeString()}] Error for ${model.name}:`, (err as Error).message);
+        }
     }
+    console.log(`[${new Date().toLocaleTimeString()}] Cycle complete. Next in 5 min.\n`);
 }
 
-setInterval(() => {
-    main()
-}, 1000 * 60 * 5);
-
-main()
+setInterval(() => { main(); }, 1000 * 60 * 5);
+main();
