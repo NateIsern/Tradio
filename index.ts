@@ -16,13 +16,25 @@ interface ToolCall { id: string; type: string; function: { name: string; argumen
 interface ChatChoice { message: { content: string | null; tool_calls?: ToolCall[] }; finish_reason: string }
 
 const MARKET_LEVERAGE: Record<string, number> = {
+  BTC: 10,
+  ETH: 10,
+  SOL: 10,
   ZEC: 5,
   HYPE: 10,
-  SOL: 10,
+  DOGE: 10,
+  XRP: 10,
+  LINK: 10,
+  BNB: 10,
+  AVAX: 10,
+  DOT: 10,
+  AAVE: 10,
+  APT: 10,
+  WLD: 10,
+  ENA: 10,
 };
 
 function callDOChat(model: string, messages: ChatMessage[], tools: object[]): ChatChoice {
-  const body = JSON.stringify({ model, messages, tools, max_completion_tokens: 2048 });
+  const body = JSON.stringify({ model, messages, tools, max_completion_tokens: 4096 });
   const tmpFile = "/tmp/tradio-request.json";
   writeFileSync(tmpFile, body);
   const resp = execSync(
@@ -120,11 +132,11 @@ export const invokeAgent = async (account: Account) => {
         parameters: {
           type: "object",
           properties: {
-            symbol: { type: "string", enum: Object.keys(MARKETS), description: "The symbol to open the position at" },
+            symbol: { type: "string", enum: Object.keys(MARKETS), description: "The market symbol" },
             side: { type: "string", enum: ["LONG", "SHORT"] },
-            quantity: { type: "number", description: "The quantity of the position to open" },
+            amount: { type: "number", description: "Dollar amount to allocate to this trade (e.g. 20 = $20)" },
           },
-          required: ["symbol", "side", "quantity"],
+          required: ["symbol", "side", "amount"],
         },
       },
     },
@@ -147,16 +159,15 @@ export const invokeAgent = async (account: Account) => {
       if (tc.function.name === "createPosition") {
         const side = args.side as "LONG" | "SHORT";
         const symbol = args.symbol as string;
+        const amount = Math.min(args.amount ?? 10, parseFloat(portfolio.available));
         const leverage = MARKET_LEVERAGE[symbol] ?? 5;
-        const availableBalance = parseFloat(portfolio.available);
-        const riskAmount = availableBalance * 0.02;
-        const quantity = Number((riskAmount * leverage).toFixed(2));
+        const quantity = Number((amount * leverage).toFixed(2));
 
         await createPosition(account, symbol, side, quantity);
         await prisma.toolCalls.create({
-          data: { invocationId: modelInvocation.id, toolCallType: ToolCallType.CREATE_POSITION, metadata: JSON.stringify({ symbol, side, quantity }) },
+          data: { invocationId: modelInvocation.id, toolCallType: ToolCallType.CREATE_POSITION, metadata: JSON.stringify({ symbol, side, quantity, amount }) },
         });
-        responseText += ` [Created ${side} ${quantity} ${symbol} (2% risk, ${leverage}x leverage)]`;
+        responseText += ` [${side} ${symbol} $${amount} -> ${quantity} units @ ${leverage}x]`;
       } else if (tc.function.name === "closeAllPosition") {
         await cancelAllOrders(account);
         await prisma.toolCalls.create({
