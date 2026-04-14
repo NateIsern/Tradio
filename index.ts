@@ -61,10 +61,15 @@ function callDOChat(model: string, messages: ChatMessage[], tools: object[]): Ch
 export const invokeAgent = async (account: Account) => {
 
   let ALL_INDICATOR_DATA = "";
+  let MARKETS_INFO = "";
   const marketSlugs = Object.keys(MARKETS) as Array<keyof typeof MARKETS>;
   await Promise.all(marketSlugs.map(async (marketSlug) => {
     const intradayIndicators = await getIndicators("5m", MARKETS[marketSlug].marketId);
     const longTermIndicators = await getIndicators("4h", MARKETS[marketSlug].marketId);
+    const leverage = MARKET_LEVERAGE[marketSlug] ?? 10;
+    const lastPrice = intradayIndicators.midPrices[intradayIndicators.midPrices.length - 1] ?? 0;
+    const lastRsi = intradayIndicators.rsi[intradayIndicators.rsi.length - 1] ?? 0;
+    MARKETS_INFO += `${marketSlug}: $${lastPrice} | ${leverage}x leverage | RSI ${lastRsi}\n`;
 
     ALL_INDICATOR_DATA = ALL_INDICATOR_DATA + `
     MARKET - ${marketSlug}
@@ -132,6 +137,7 @@ export const invokeAgent = async (account: Account) => {
   .replace("{{CURRENT_ACCOUNT_VALUE}}", portfolio.total)
   .replace("{{CURRENT_ACCOUNT_POSITIONS}}", JSON.stringify(openPositions))
   .replace("{{TRADE_HISTORY}}", tradeHistory)
+  .replace("{{MARKETS_INFO}}", MARKETS_INFO.trim())
 
   console.log("Calling AI model:", account.modelName);
 
