@@ -79,6 +79,102 @@ export function getRSI(prices: number[], period: number = 14): number[] {
     return rsiValues;
 }
 
+// True Range at bar i requires the previous close. TR_0 is undefined; we start at i=1.
+function getTrueRange(highs: number[], lows: number[], closes: number[]): number[] {
+    const tr: number[] = [];
+    for (let i = 1; i < highs.length; i++) {
+        const h = highs[i] ?? 0;
+        const l = lows[i] ?? 0;
+        const prevClose = closes[i - 1] ?? 0;
+        tr.push(Math.max(
+            h - l,
+            Math.abs(h - prevClose),
+            Math.abs(l - prevClose),
+        ));
+    }
+    return tr;
+}
+
+// Wilder smoothing: ATR_p = mean(TR_1..TR_p); ATR_i = (ATR_{i-1} * (p-1) + TR_i) / p
+function wilderSmooth(values: number[], period: number): number[] {
+    if (values.length < period) return [];
+    const out: number[] = [];
+    let sum = 0;
+    for (let i = 0; i < period; i++) sum += values[i] ?? 0;
+    out.push(sum / period);
+    for (let i = period; i < values.length; i++) {
+        const prev = out[out.length - 1] ?? 0;
+        out.push((prev * (period - 1) + (values[i] ?? 0)) / period);
+    }
+    return out;
+}
+
+export function getATR(
+    highs: number[],
+    lows: number[],
+    closes: number[],
+    period: number = 14,
+): number[] {
+    if (highs.length < period + 1) return [];
+    const tr = getTrueRange(highs, lows, closes);
+    return wilderSmooth(tr, period);
+}
+
+// ADX (Wilder 14). Returns the ADX series; callers typically only need the last value.
+// +DM_i = up-move  if up-move > down-move and > 0, else 0
+// -DM_i = down-move if down-move > up-move and > 0, else 0
+// +DI = 100 * smoothed+DM / smoothedTR ; -DI analogous
+// DX = 100 * |+DI - -DI| / (+DI + -DI)
+// ADX = Wilder smoothing of DX over `period` bars.
+export function getADX(
+    highs: number[],
+    lows: number[],
+    closes: number[],
+    period: number = 14,
+): { adx: number[]; plusDI: number[]; minusDI: number[] } {
+    if (highs.length < period * 2 + 1) return { adx: [], plusDI: [], minusDI: [] };
+
+    const plusDM: number[] = [];
+    const minusDM: number[] = [];
+    const tr: number[] = [];
+    for (let i = 1; i < highs.length; i++) {
+        const upMove = (highs[i] ?? 0) - (highs[i - 1] ?? 0);
+        const downMove = (lows[i - 1] ?? 0) - (lows[i] ?? 0);
+        plusDM.push(upMove > downMove && upMove > 0 ? upMove : 0);
+        minusDM.push(downMove > upMove && downMove > 0 ? downMove : 0);
+        const h = highs[i] ?? 0;
+        const l = lows[i] ?? 0;
+        const prevClose = closes[i - 1] ?? 0;
+        tr.push(Math.max(h - l, Math.abs(h - prevClose), Math.abs(l - prevClose)));
+    }
+
+    const smoothPlusDM = wilderSmooth(plusDM, period);
+    const smoothMinusDM = wilderSmooth(minusDM, period);
+    const smoothTR = wilderSmooth(tr, period);
+
+    const plusDI: number[] = [];
+    const minusDI: number[] = [];
+    const dx: number[] = [];
+    for (let i = 0; i < smoothTR.length; i++) {
+        const trVal = smoothTR[i] ?? 0;
+        if (trVal === 0) {
+            plusDI.push(0);
+            minusDI.push(0);
+            dx.push(0);
+            continue;
+        }
+        const pDI = 100 * ((smoothPlusDM[i] ?? 0) / trVal);
+        const mDI = 100 * ((smoothMinusDM[i] ?? 0) / trVal);
+        plusDI.push(pDI);
+        minusDI.push(mDI);
+        const sum = pDI + mDI;
+        dx.push(sum === 0 ? 0 : (100 * Math.abs(pDI - mDI)) / sum);
+    }
+
+    const adx = wilderSmooth(dx, period);
+    return { adx, plusDI, minusDI };
+}
+
 export function getBollingerBands(
     prices: number[],
     period: number = 20,

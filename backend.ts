@@ -163,6 +163,105 @@ app.get("/stats", async (_req, res) => {
   }
 });
 
+// Risk engine observability: equity, drawdown, breakers, recent rejected trades.
+app.get("/risk-stats", async (_req, res) => {
+  try {
+    const model = await prisma.models.findFirst();
+    if (!model) {
+      res.status(500).json({ error: "No model configured" });
+      return;
+    }
+
+    const startOfDay = new Date();
+    startOfDay.setUTCHours(0, 0, 0, 0);
+
+    const [
+      latestPortfolio,
+      todayPortfolios,
+      allTimePortfolios,
+      activeHalts,
+      recentToolCalls,
+    ] = await Promise.all([
+      prisma.portfolioSize.findFirst({
+        where: { modelId: model.id },
+        orderBy: { createdAt: "desc" },
+      }),
+      prisma.portfolioSize.findMany({
+        where: { modelId: model.id, createdAt: { gte: startOfDay } },
+        select: { netPortfolio: true },
+      }),
+      prisma.portfolioSize.findMany({
+        where: { modelId: model.id },
+        select: { netPortfolio: true },
+      }),
+      prisma.riskHaltEvent.findMany({
+        where: { modelId: model.id, clearsAt: { gt: new Date() } },
+        orderBy: { createdAt: "desc" },
+      }),
+      prisma.toolCalls.findMany({
+        where: { invocation: { modelId: model.id } },
+        orderBy: { createdAt: "desc" },
+        take: 50,
+      }),
+    ]);
+
+    let openPositionsCount = 0;
+    try {
+      const token = getAuthToken();
+      const accountIndex = model.accountIndex;
+      const raw = fetchH2(`${BASE_URL}/api/v1/account?by=index&value=${accountIndex}`, token);
+      const parsed = JSON.parse(raw) as { accounts?: Array<{ positions?: Array<{ position?: string }> }> };
+      const positions = parsed.accounts?.[0]?.positions ?? [];
+      openPositionsCount = positions.filter((p) => Number(p.position ?? 0) !== 0).length;
+    } catch {
+      // ignore — best-effort live lookup
+    }
+
+    const equity = latestPortfolio ? Number(latestPortfolio.netPortfolio) : 0;
+
+    const todayValues = todayPortfolios
+      .map((p) => Number(p.netPortfolio))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    const dayHigh = todayValues.length > 0 ? Math.max(...todayValues) : equity;
+    const ddDay = dayHigh > 0 ? (equity - dayHigh) / dayHigh : 0;
+
+    const allTimeValues = allTimePortfolios
+      .map((p) => Number(p.netPortfolio))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    const allTimeHigh = allTimeValues.length > 0 ? Math.max(...allTimeValues) : equity;
+    const ddAllTime = allTimeHigh > 0 ? (equity - allTimeHigh) / allTimeHigh : 0;
+
+    const rejectedCount = recentToolCalls.filter((tc) => tc.toolCallType === "REJECTED").length;
+    const createdCount = recentToolCalls.filter((tc) => tc.toolCallType === "CREATE_POSITION").length;
+    const closedCount = recentToolCalls.filter((tc) => tc.toolCallType === "CLOSE_POSITION").length;
+    const slCount = recentToolCalls.filter((tc) => tc.toolCallType === "SET_SL").length;
+
+    res.json({
+      equity,
+      dayHigh,
+      allTimeHigh,
+      ddDayPct: Number((ddDay * 100).toFixed(3)),
+      ddAllTimePct: Number((ddAllTime * 100).toFixed(3)),
+      openPositions: openPositionsCount,
+      breakers: activeHalts.map((h) => ({
+        type: h.type,
+        triggeredAt: h.triggeredAt,
+        clearsAt: h.clearsAt,
+      })),
+      last50ToolCalls: {
+        rejected: rejectedCount,
+        created: createdCount,
+        closed: closedCount,
+        stopLoss: slCount,
+      },
+      lastPortfolioUpdate: latestPortfolio?.createdAt ?? null,
+    });
+  } catch (err) {
+    console.error("Error fetching risk stats:", err);
+    res.status(500).json({ error: "Failed to fetch risk stats" });
+  }
+});
+
 type MarketPriceEntry = {
   price: number;
   change24h: number;

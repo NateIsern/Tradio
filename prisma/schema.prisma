@@ -60,7 +60,33 @@ model PortfolioSize {
   @@index([modelId])
 }
 
+// Fires whenever the risk engine pauses trading. The live loop skips LLM invocations
+// while an unexpired halt exists for the given model.
+model RiskHaltEvent {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  modelId      String   @db.ObjectId
+  type         HaltType
+  triggeredAt  DateTime @default(now())
+  clearsAt     DateTime
+  payload      String
+  createdAt    DateTime @default(now())
+
+  @@index([modelId, clearsAt])
+}
+
 enum ToolCallType {
   CREATE_POSITION
   CLOSE_POSITION
+  SET_SL
+  SET_TP
+  HALT
+  REJECTED
+}
+
+enum HaltType {
+  DAILY_DD
+  HARD_DAILY_DD
+  WEEKLY_DD
+  CONSECUTIVE_LOSSES
+  MANUAL
 }
