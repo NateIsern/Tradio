@@ -71,13 +71,15 @@ export default function PositionsPanel({ positions }: Props) {
                       </span>
                     </td>
                     <td className="py-2 px-2 text-right text-terminal-text tabular-nums">
-                      {pos.size.toFixed(2)}
+                      {pos.size < 1
+                        ? pos.size.toPrecision(3)
+                        : pos.size.toFixed(2)}
                     </td>
                     <td className="py-2 px-2 text-right text-terminal-muted tabular-nums">
-                      ${pos.entryPrice.toFixed(2)}
+                      ${pos.entryPrice < 1 ? pos.entryPrice.toPrecision(4) : pos.entryPrice.toFixed(2)}
                     </td>
                     <td className="py-2 px-2 text-right text-terminal-text tabular-nums">
-                      ${pos.markPrice.toFixed(2)}
+                      ${pos.markPrice < 1 ? pos.markPrice.toPrecision(4) : pos.markPrice.toFixed(2)}
                     </td>
                     <td
                       className={`py-2 px-2 text-right font-medium tabular-nums ${

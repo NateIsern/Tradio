@@ -14,7 +14,7 @@ async def main():
         account_index=ACCOUNT_INDEX,
     )
     token, err = client.create_auth_token_with_expiry(
-        deadline=28800,
+        deadline=21600,
         api_key_index=API_KEY_INDEX,
     )
     if err:
