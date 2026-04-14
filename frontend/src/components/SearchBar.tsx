@@ -62,21 +62,15 @@ export default function SearchBar({ prices }: Props) {
 
   return (
     <>
-      {/* Floating trigger button */}
+      {/* Floating circular search button */}
       <button
         onClick={() => setOpen(true)}
-        className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 flex items-center gap-3 rounded-2xl border border-terminal-border bg-terminal-surface/95 backdrop-blur-md px-5 py-2.5 shadow-lg shadow-black/40 hover:border-terminal-green/40 hover:bg-terminal-panel transition-all cursor-text group"
+        className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 h-12 w-12 rounded-full border border-terminal-border bg-terminal-surface/95 backdrop-blur-md shadow-lg shadow-black/40 hover:border-terminal-green/40 hover:bg-terminal-panel hover:shadow-terminal-green/10 hover:shadow-xl transition-all flex items-center justify-center group"
       >
-        <svg className="w-4 h-4 text-terminal-subtle group-hover:text-terminal-green transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+        <svg className="w-5 h-5 text-terminal-subtle group-hover:text-terminal-green transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
           <circle cx="11" cy="11" r="8" />
           <line x1="21" y1="21" x2="16.65" y2="16.65" />
         </svg>
-        <span className="text-xs text-terminal-subtle group-hover:text-terminal-muted transition-colors">
-          Search stocks, crypto, forex...
-        </span>
-        <kbd className="hidden sm:inline-flex items-center gap-0.5 rounded border border-terminal-border bg-terminal-bg px-1.5 py-0.5 text-[9px] text-terminal-subtle">
-          <span>Ctrl</span><span>K</span>
-        </kbd>
       </button>
 
       {/* Overlay + Search modal */}
