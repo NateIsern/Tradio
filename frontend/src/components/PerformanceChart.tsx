@@ -70,7 +70,7 @@ export default function PerformanceChart({ data }: Props) {
   }, [data]);
 
   return (
-    <div className="relative w-full flex flex-1 border-r-2 border-black" style={{ minHeight: 300 }}>
+    <div className="relative w-full flex-1 border-r-2 border-black" style={{ minHeight: 400, height: '100%' }}>
       {/* Title */}
       <div className="absolute left-1/2 top-2 -translate-x-1/2 z-10">
         <h2 className="text-sm font-bold text-black font-mono">TOTAL ACCOUNT VALUE</h2>
@@ -81,7 +81,7 @@ export default function PerformanceChart({ data }: Props) {
           Waiting for data... bot runs every 5 min
         </div>
       ) : (
-      <ResponsiveContainer width="100%" height="100%" minHeight={300}>
+      <ResponsiveContainer width="99%" height={400}>
         <LineChart
           data={chartData}
           margin={{ top: 40, right: 80, bottom: 0, left: 20 }}
@@ -131,10 +131,11 @@ export default function PerformanceChart({ data }: Props) {
           />
 
           <ReferenceLine
-            y={1000}
+            y={55.93}
             stroke="rgba(0, 0, 0, 0.3)"
             strokeWidth={2}
             strokeDasharray="5 5"
+            label={{ value: "Start", position: "right", fontSize: 10 }}
           />
 
           {seriesNames.map((name) => (
