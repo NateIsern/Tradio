@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import {
-  LineChart,
-  Line,
+  AreaChart,
+  Area,
   XAxis,
   YAxis,
   Tooltip,
@@ -16,11 +16,22 @@ type PerformanceItem = {
   netPortfolio: string | number;
 };
 
-type Props = { data: PerformanceItem[] };
+type Stats = {
+  totalTrades: number;
+  currentValue: number;
+  startingValue: number;
+  pnl: number;
+};
+
+type Props = {
+  data: PerformanceItem[];
+  stats: Stats | null;
+};
 
 const CHART_GREEN = "#00ff88";
+const CHART_GREEN_DIM = "#00ff8830";
 
-export default function PerformanceChart({ data }: Props) {
+export default function PerformanceChart({ data, stats }: Props) {
   const chartData = useMemo(() => {
     if (!Array.isArray(data) || data.length === 0) return [];
 
@@ -32,7 +43,6 @@ export default function PerformanceChart({ data }: Props) {
       .filter((p) => Number.isFinite(p.v))
       .sort((a, b) => a.t - b.t);
 
-    // Merge points close in time into buckets
     if (points.length === 0) return [];
 
     const gaps: number[] = [];
@@ -74,12 +84,39 @@ export default function PerformanceChart({ data }: Props) {
     return rows;
   }, [data]);
 
+  const pnlPercent =
+    stats && stats.startingValue > 0
+      ? ((stats.currentValue - stats.startingValue) / stats.startingValue) * 100
+      : 0;
+  const pnlPositive = stats ? stats.pnl >= 0 : true;
+
   return (
-    <div className="relative flex flex-1 flex-col bg-terminal-bg border-r border-terminal-border">
+    <div className="relative flex flex-col bg-terminal-bg min-h-0">
       <div className="px-4 pt-3 pb-1">
-        <h2 className="text-xs font-bold text-terminal-muted tracking-widest">
+        <div className="text-[10px] font-bold text-terminal-muted tracking-widest mb-1">
           PORTFOLIO VALUE
-        </h2>
+        </div>
+        {stats && (
+          <div className="flex items-baseline gap-3">
+            <span className="text-2xl font-bold text-terminal-text">
+              ${stats.currentValue.toFixed(2)}
+            </span>
+            <span
+              className={`text-sm font-semibold ${
+                pnlPositive ? "text-terminal-green" : "text-terminal-red"
+              }`}
+            >
+              {pnlPositive ? "+" : ""}{pnlPercent.toFixed(2)}%
+            </span>
+            <span
+              className={`text-sm ${
+                pnlPositive ? "text-terminal-green" : "text-terminal-red"
+              }`}
+            >
+              ({pnlPositive ? "+$" : "-$"}{Math.abs(stats.pnl).toFixed(2)})
+            </span>
+          </div>
+        )}
       </div>
 
       {chartData.length === 0 ? (
@@ -89,10 +126,16 @@ export default function PerformanceChart({ data }: Props) {
       ) : (
         <div className="flex-1 min-h-0 px-2 pb-2">
           <ResponsiveContainer width="100%" height="100%">
-            <LineChart
+            <AreaChart
               data={chartData}
-              margin={{ top: 16, right: 40, bottom: 8, left: 16 }}
+              margin={{ top: 8, right: 40, bottom: 8, left: 16 }}
             >
+              <defs>
+                <linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={CHART_GREEN} stopOpacity={0.3} />
+                  <stop offset="100%" stopColor={CHART_GREEN} stopOpacity={0.02} />
+                </linearGradient>
+              </defs>
               <CartesianGrid
                 strokeDasharray="2 6"
                 stroke="#1a1a24"
@@ -149,18 +192,20 @@ export default function PerformanceChart({ data }: Props) {
                 itemStyle={{ color: CHART_GREEN }}
                 formatter={(value: number) => [`$${value.toFixed(2)}`, "Value"]}
               />
-              <Line
+              <Area
                 type="monotone"
                 dataKey="value"
                 dot={false}
                 strokeWidth={2}
                 stroke={CHART_GREEN}
+                fill="url(#chartGradient)"
+                fillOpacity={1}
                 strokeLinecap="round"
                 strokeLinejoin="round"
                 isAnimationActive={false}
                 connectNulls
               />
-            </LineChart>
+            </AreaChart>
           </ResponsiveContainer>
         </div>
       )}

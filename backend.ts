@@ -3,6 +3,7 @@ import { PrismaClient, type PortfolioSize } from "./generated/prisma/client";
 import cors from "cors";
 import { getAuthToken, fetchH2 } from "./auth";
 import { BASE_URL } from "./config";
+import { MARKETS } from "./markets";
 
 const prisma = new PrismaClient();
 
@@ -94,24 +95,19 @@ app.get("/positions", async (_req, res) => {
       unrealizedPnl: number;
     }> = [];
 
-    if (account.positions && Array.isArray(account.positions)) {
-      for (const pos of account.positions) {
-        const size = Number(pos.size ?? pos.quantity ?? 0);
+    const acct = account.accounts?.[0];
+    if (acct?.positions && Array.isArray(acct.positions)) {
+      for (const pos of acct.positions) {
+        const size = Number(pos.position ?? pos.size ?? 0);
         if (size === 0) continue;
-        const entryPrice = Number(pos.entry_price ?? pos.entryPrice ?? 0);
-        const markPrice = Number(pos.mark_price ?? pos.markPrice ?? entryPrice);
-        const side = size > 0 ? "LONG" as const : "SHORT" as const;
-        const absSize = Math.abs(size);
-        const unrealizedPnl = side === "LONG"
-          ? (markPrice - entryPrice) * absSize
-          : (entryPrice - markPrice) * absSize;
+        const side = (pos.sign === 1 || pos.sign === "1") ? "LONG" as const : "SHORT" as const;
         positions.push({
-          symbol: pos.symbol ?? pos.market ?? `Market-${pos.market_index ?? pos.marketIndex ?? "?"}`,
+          symbol: pos.symbol ?? "?",
           side,
-          size: absSize,
-          entryPrice,
-          markPrice,
-          unrealizedPnl,
+          size: Math.abs(size),
+          entryPrice: Number(pos.entryPrice ?? pos.entry_price ?? 0),
+          markPrice: Number(pos.markPrice ?? pos.mark_price ?? 0),
+          unrealizedPnl: Number(pos.unrealizedPnl ?? pos.unrealized_pnl ?? 0),
         });
       }
     }
@@ -154,6 +150,73 @@ app.get("/stats", async (_req, res) => {
   } catch (err) {
     console.error("Error fetching stats:", err);
     res.status(500).json({ error: "Failed to fetch stats" });
+  }
+});
+
+type MarketPriceEntry = {
+  price: number;
+  change24h: number;
+};
+
+let marketPricesCache: Record<string, MarketPriceEntry> = {};
+let marketPricesLastUpdated: Date | null = null;
+let marketPricesRefreshInFlight = false;
+
+async function refreshMarketPrices() {
+  if (marketPricesRefreshInFlight) return;
+  marketPricesRefreshInFlight = true;
+  try {
+    const token = getAuthToken();
+    const results: Record<string, MarketPriceEntry> = {};
+
+    const now = Date.now();
+    for (const [symbol, market] of Object.entries(MARKETS)) {
+      try {
+        const url = `${BASE_URL}/api/v1/candles?market_id=${market.marketId}&resolution=1h&start_timestamp=${now - 86400000}&end_timestamp=${now}&count_back=25`;
+        const raw = fetchH2(url, token);
+        const data = JSON.parse(raw) as { c?: Array<{ o: number; c: number; h: number; l: number }> };
+        const candles = data.c;
+
+        if (candles && candles.length > 0) {
+          const latest = candles[candles.length - 1];
+          const currentPrice = latest.c;
+          let change24h = 0;
+          if (candles.length >= 2) {
+            const oldPrice = candles[0].c;
+            if (oldPrice > 0) {
+              change24h = ((currentPrice - oldPrice) / oldPrice) * 100;
+            }
+          }
+          results[symbol] = { price: currentPrice, change24h };
+        }
+      } catch (err) {
+        // skip failed markets silently
+      }
+    }
+
+    marketPricesCache = results;
+    marketPricesLastUpdated = new Date();
+  } catch (err) {
+    console.error("Error refreshing market prices:", err);
+  } finally {
+    marketPricesRefreshInFlight = false;
+  }
+}
+
+app.get("/market-prices", async (_req, res) => {
+  const now = Date.now();
+  const isFresh = marketPricesLastUpdated && marketPricesLastUpdated.getTime() + 1000 * 60 * 2 > now;
+
+  if (Object.keys(marketPricesCache).length === 0) {
+    await refreshMarketPrices();
+    res.json({ prices: marketPricesCache, lastUpdated: marketPricesLastUpdated });
+    return;
+  }
+
+  res.json({ prices: marketPricesCache, lastUpdated: marketPricesLastUpdated, stale: !isFresh });
+
+  if (!isFresh && !marketPricesRefreshInFlight) {
+    void refreshMarketPrices();
   }
 });
 

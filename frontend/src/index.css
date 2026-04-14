@@ -124,3 +124,17 @@ body {
   color: #9ca3af;
   font-style: italic;
 }
+
+/* Hide scrollbar for ticker bar */
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+/* Tabular nums for financial data */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}

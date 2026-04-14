@@ -219,8 +219,8 @@ async function main() {
             console.error(`[${new Date().toLocaleTimeString()}] Error for ${model.name}:`, (err as Error).message);
         }
     }
-    console.log(`[${new Date().toLocaleTimeString()}] Cycle complete. Next in 5 min.\n`);
+    console.log(`[${new Date().toLocaleTimeString()}] Cycle complete. Next in 2 min.\n`);
 }
 
-setInterval(() => { main(); }, 1000 * 60 * 5);
+setInterval(() => { main(); }, 1000 * 60 * 2);
 main();

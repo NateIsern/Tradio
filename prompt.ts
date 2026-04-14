@@ -49,6 +49,11 @@ export const PROMPT = [
   "## Market Data (oldest -> newest)",
   "{{ALL_INDICATOR_DATA}}",
   "",
+  "## Risk Management",
+  "- Trading fees on Lighter: 0% maker and taker fees. No commission cost per trade.",
+  "- Since there are zero fees, you can trade frequently without worrying about commission drag.",
+  "- The only fee risk is liquidation (1% fee if liquidated). Keep positions well-margined.",
+  "",
   "## Live Positions Detail",
   "{{CURRENT_ACCOUNT_POSITIONS}}",
 ].join("\n");
