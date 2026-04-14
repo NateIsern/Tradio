@@ -39,8 +39,6 @@ export const RISK = {
 // LLM determinism
 export const LLM_CONFIG = {
   TEMPERATURE: 0.2,
-  TOP_P: 0.9,
-  SEED: 42,
   MAX_COMPLETION_TOKENS: 4096,
   MAX_RETRIES: 3,
   RETRY_BACKOFF_MS: [1000, 3000, 9000],

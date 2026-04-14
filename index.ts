@@ -68,8 +68,6 @@ async function callDOChat(
     tools,
     max_completion_tokens: LLM_CONFIG.MAX_COMPLETION_TOKENS,
     temperature: LLM_CONFIG.TEMPERATURE,
-    top_p: LLM_CONFIG.TOP_P,
-    seed: LLM_CONFIG.SEED,
     tool_choice: "auto",
   });
 
