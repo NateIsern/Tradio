@@ -27,6 +27,7 @@
     "axios": "^1.15.0",
     "cors": "^2.8.5",
     "express": "^5.1.0",
+    "lightweight-charts": "^5.1.0",
     "prisma": "^6.18.0",
     "recharts": "^3.3.0",
     "whatwg-fetch": "^3.6.20"

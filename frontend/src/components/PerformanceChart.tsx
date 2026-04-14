@@ -1,13 +1,5 @@
-import { useMemo } from "react";
-import {
-  AreaChart,
-  Area,
-  XAxis,
-  YAxis,
-  Tooltip,
-  CartesianGrid,
-  ResponsiveContainer,
-} from "recharts";
+import { useEffect, useRef, useMemo } from "react";
+import { createChart, type IChartApi, type ISeriesApi, AreaSeries, ColorType, LineStyle } from "lightweight-charts";
 
 type PerformanceItem = {
   createdAt: string;
@@ -28,60 +20,102 @@ type Props = {
   stats: Stats | null;
 };
 
-const CHART_GREEN = "#00ff88";
-
 export default function PerformanceChart({ data, stats }: Props) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<IChartApi | null>(null);
+  const seriesRef = useRef<ISeriesApi<"Area"> | null>(null);
+
   const chartData = useMemo(() => {
     if (!Array.isArray(data) || data.length === 0) return [];
 
     const points = data
       .map((item) => ({
-        t: new Date(item.createdAt).getTime(),
-        v: Number(item.netPortfolio),
+        time: Math.floor(new Date(item.createdAt).getTime() / 1000) as import("lightweight-charts").UTCTimestamp,
+        value: Number(item.netPortfolio),
       }))
-      .filter((p) => Number.isFinite(p.v))
-      .sort((a, b) => a.t - b.t);
+      .filter((p) => Number.isFinite(p.value))
+      .sort((a, b) => (a.time as number) - (b.time as number));
 
-    if (points.length === 0) return [];
-
-    const gaps: number[] = [];
-    for (let i = 1; i < points.length; i++) {
-      gaps.push(points[i].t - points[i - 1].t);
-    }
-    const medianGap = gaps.length
-      ? gaps.sort((a, b) => a - b)[Math.floor(gaps.length / 2)]
-      : 60_000;
-    const tolerance = Math.min(
-      5 * 60_000,
-      Math.max(5_000, Math.floor((medianGap || 60_000) * 1.5))
-    );
-
-    const rows: Array<{ t: number; value: number }> = [];
-    let bucketStart = points[0].t;
-    let bucketEnd = points[0].t;
-    let bucketValues: number[] = [];
-
-    const flush = () => {
-      const center = Math.round((bucketStart + bucketEnd) / 2);
-      const avg =
-        bucketValues.reduce((s, v) => s + v, 0) / bucketValues.length;
-      rows.push({ t: center, value: avg });
-      bucketValues = [];
-    };
-
-    for (const p of points) {
-      if (p.t - bucketEnd > tolerance) {
-        flush();
-        bucketStart = p.t;
-        bucketEnd = p.t;
-      }
-      bucketEnd = Math.max(bucketEnd, p.t);
-      bucketValues.push(p.v);
-    }
-    flush();
-
-    return rows;
+    // Deduplicate by time
+    const seen = new Set<number>();
+    return points.filter((p) => {
+      if (seen.has(p.time as number)) return false;
+      seen.add(p.time as number);
+      return true;
+    });
   }, [data]);
+
+  // Create chart once
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    const chart = createChart(containerRef.current, {
+      layout: {
+        background: { type: ColorType.Solid, color: "#0a0a0f" },
+        textColor: "#6b7280",
+        fontFamily: "monospace",
+        fontSize: 10,
+      },
+      grid: {
+        vertLines: { color: "#1a1a24", style: LineStyle.Dotted },
+        horzLines: { color: "#1a1a24", style: LineStyle.Dotted },
+      },
+      crosshair: {
+        vertLine: { color: "#00ff8840", labelBackgroundColor: "#111118" },
+        horzLine: { color: "#00ff8840", labelBackgroundColor: "#111118" },
+      },
+      rightPriceScale: {
+        borderColor: "#2a2a35",
+        scaleMargins: { top: 0.1, bottom: 0.05 },
+      },
+      timeScale: {
+        borderColor: "#2a2a35",
+        timeVisible: true,
+        secondsVisible: false,
+      },
+      handleScale: true,
+      handleScroll: true,
+    });
+
+    const series = chart.addSeries(AreaSeries, {
+      lineColor: "#00ff88",
+      lineWidth: 2,
+      topColor: "rgba(0, 255, 136, 0.25)",
+      bottomColor: "rgba(0, 255, 136, 0.02)",
+      crosshairMarkerBackgroundColor: "#00ff88",
+      crosshairMarkerBorderColor: "#00ff88",
+      crosshairMarkerRadius: 4,
+      priceFormat: { type: "price", precision: 2, minMove: 0.01 },
+    });
+
+    chartRef.current = chart;
+    seriesRef.current = series;
+
+    const ro = new ResizeObserver(() => {
+      if (containerRef.current) {
+        chart.applyOptions({
+          width: containerRef.current.clientWidth,
+          height: containerRef.current.clientHeight,
+        });
+      }
+    });
+    ro.observe(containerRef.current);
+
+    return () => {
+      ro.disconnect();
+      chart.remove();
+      chartRef.current = null;
+      seriesRef.current = null;
+    };
+  }, []);
+
+  // Update data
+  useEffect(() => {
+    if (seriesRef.current && chartData.length > 0) {
+      seriesRef.current.setData(chartData);
+      chartRef.current?.timeScale().fitContent();
+    }
+  }, [chartData]);
 
   const pnlPercent =
     stats && stats.startingValue > 0
@@ -120,93 +154,10 @@ export default function PerformanceChart({ data, stats }: Props) {
 
       {chartData.length === 0 ? (
         <div className="flex flex-1 items-center justify-center text-terminal-muted text-sm">
-          Waiting for data... bot runs every 5 min
+          Waiting for data... bot runs every 2 min
         </div>
       ) : (
-        <div className="flex-1 min-h-0 px-2 pb-2">
-          <ResponsiveContainer width="100%" height="100%">
-            <AreaChart
-              data={chartData}
-              margin={{ top: 8, right: 40, bottom: 8, left: 16 }}
-            >
-              <defs>
-                <linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={CHART_GREEN} stopOpacity={0.3} />
-                  <stop offset="100%" stopColor={CHART_GREEN} stopOpacity={0.02} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid
-                strokeDasharray="2 6"
-                stroke="#1a1a24"
-                strokeWidth={0.5}
-              />
-              <XAxis
-                dataKey="t"
-                type="number"
-                domain={["auto", "auto"]}
-                tickFormatter={(v: number) => {
-                  const date = new Date(v);
-                  return date.toLocaleDateString("en-US", {
-                    month: "short",
-                    day: "numeric",
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  });
-                }}
-                tick={{
-                  fontSize: 10,
-                  fontFamily: "monospace",
-                  fill: "#6b7280",
-                }}
-                stroke="#2a2a35"
-                strokeWidth={1}
-                axisLine={{ stroke: "#2a2a35" }}
-                tickLine={{ stroke: "#2a2a35" }}
-              />
-              <YAxis
-                tick={{
-                  fontSize: 10,
-                  fontFamily: "monospace",
-                  fill: "#6b7280",
-                }}
-                tickFormatter={(v: number) => `$${v.toFixed(2)}`}
-                domain={["auto", "auto"]}
-                stroke="#2a2a35"
-                strokeWidth={1}
-                axisLine={{ stroke: "#2a2a35" }}
-                tickLine={{ stroke: "#2a2a35" }}
-              />
-              <Tooltip
-                labelFormatter={(label: number) =>
-                  new Date(label).toLocaleString()
-                }
-                contentStyle={{
-                  backgroundColor: "#111118",
-                  border: "1px solid #2a2a35",
-                  borderRadius: "4px",
-                  fontFamily: "monospace",
-                  fontSize: "11px",
-                  color: "#e5e7eb",
-                }}
-                itemStyle={{ color: CHART_GREEN }}
-                formatter={(value: number) => [`$${value.toFixed(2)}`, "Value"]}
-              />
-              <Area
-                type="monotone"
-                dataKey="value"
-                dot={false}
-                strokeWidth={2}
-                stroke={CHART_GREEN}
-                fill="url(#chartGradient)"
-                fillOpacity={1}
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                isAnimationActive={false}
-                connectNulls
-              />
-            </AreaChart>
-          </ResponsiveContainer>
-        </div>
+        <div ref={containerRef} className="flex-1 min-h-0" />
       )}
     </div>
   );
