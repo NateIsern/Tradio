@@ -14,6 +14,27 @@
   --color-terminal-muted: #9ca3af;
   --color-terminal-subtle: #6b7280;
   --font-mono: "JetBrains Mono", "Fira Code", "SF Mono", "Cascadia Code", ui-monospace, monospace;
+
+  /* shadcn-compatible theme vars mapped to terminal palette */
+  --color-background: #0a0a0f;
+  --color-foreground: #e5e7eb;
+  --color-card: #111118;
+  --color-card-foreground: #e5e7eb;
+  --color-popover: #111118;
+  --color-popover-foreground: #e5e7eb;
+  --color-primary: #00ff88;
+  --color-primary-foreground: #0a0a0f;
+  --color-secondary: #1a1a24;
+  --color-secondary-foreground: #e5e7eb;
+  --color-muted: #1a1a24;
+  --color-muted-foreground: #9ca3af;
+  --color-accent: #1a1a24;
+  --color-accent-foreground: #00ff88;
+  --color-destructive: #ff4444;
+  --color-destructive-foreground: #ffffff;
+  --color-border: #2a2a35;
+  --color-input: #2a2a35;
+  --color-ring: #00ff88;
 }
 
 body {

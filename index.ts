@@ -10,6 +10,7 @@ import { cancelAllOrders } from './cancelOrder';
 import { PrismaClient, ToolCallType } from './generated/prisma/client';
 import { getPortfolio } from './getPortfolio';
 import { getAuthToken, fetchH2 } from './auth';
+import { BASE_URL } from './config';
 
 function getLatestPrice(marketId: number): number {
   const token = getAuthToken();

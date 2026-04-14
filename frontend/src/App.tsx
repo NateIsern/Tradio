@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import PerformanceChart from "./components/PerformanceChart";
-import ChatPanel from "./components/ChatPanel";
+import RightPanel from "./components/RightPanel";
 import PositionsPanel from "./components/PositionsPanel";
 import Watchlist from "./components/Watchlist";
 import Navbar from "./components/Navbar";
@@ -129,7 +129,7 @@ export default function App() {
 
         {/* Right: AI Chat Panel */}
         <div className="w-[400px] shrink-0 border-l border-terminal-border">
-          <ChatPanel data={invocationsData} />
+          <RightPanel invocationsData={invocationsData} backendUrl={BACKEND_URL} />
         </div>
       </div>
 
