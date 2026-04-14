@@ -1,4 +1,6 @@
 import { useState } from "react";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type Invocation = {
   id: string;
@@ -116,12 +118,12 @@ export default function RecentInvocations({ data }: Props) {
                 <div className="px-4 pb-3 space-y-2">
                   {it.response && (
                     <div className="rounded border border-terminal-border bg-terminal-bg p-3">
-                      <div className="text-[10px] text-terminal-muted mb-1 font-bold">
+                      <div className="text-[10px] text-terminal-muted mb-2 font-bold">
                         AI REASONING
                       </div>
-                      <pre className="text-xs text-terminal-text font-mono whitespace-pre-wrap leading-relaxed">
-                        {it.response}
-                      </pre>
+                      <div className="ai-markdown text-xs text-terminal-text leading-relaxed">
+                        <Markdown remarkPlugins={[remarkGfm]}>{it.response}</Markdown>
+                      </div>
                     </div>
                   )}
 
