@@ -11,8 +11,8 @@ type Stats = {
 };
 
 type Props = {
-  prices: Record<string, MarketPrice>;
-  stats: Stats | null;
+  prices?: Record<string, MarketPrice>;
+  stats?: Stats | null;
 };
 
 function formatPrice(price: number): string {

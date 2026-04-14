@@ -29,7 +29,6 @@ type Props = {
 };
 
 const CHART_GREEN = "#00ff88";
-const CHART_GREEN_DIM = "#00ff8830";
 
 export default function PerformanceChart({ data, stats }: Props) {
   const chartData = useMemo(() => {
@@ -91,7 +90,7 @@ export default function PerformanceChart({ data, stats }: Props) {
   const pnlPositive = stats ? stats.pnl >= 0 : true;
 
   return (
-    <div className="relative flex flex-col bg-terminal-bg min-h-0">
+    <div className="relative flex flex-1 flex-col bg-terminal-bg min-h-0">
       <div className="px-4 pt-3 pb-1">
         <div className="text-[10px] font-bold text-terminal-muted tracking-widest mb-1">
           PORTFOLIO VALUE
