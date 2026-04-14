@@ -94,7 +94,9 @@ body {
   padding: 0;
 }
 .ai-markdown table {
-  width: 100%;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
   border-collapse: collapse;
   margin: 0.5rem 0;
   font-size: 0.7rem;
