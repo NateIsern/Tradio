@@ -1,45 +1,76 @@
-export default function Navbar() {
-  return (
-    <nav className="sticky top-0 z-50 border-b-2 border-black">
-      <div className="mx-auto max-w-[95vw] px-2">
-        <div className="flex h-10 md:h-14 items-center justify-between font-bold">
-          <div className="flex items-center">
-            <a href="/">TRADIO
-              {/* <img
-                src="/logos/alpha_logo.png"
-                alt="Alpha Arena"
-                className="h-8 md:h-12 w-auto -ml-2 md:ml-0 cursor-pointer"
-              /> */}
-            </a>
-          </div>
+import { useEffect, useState, useCallback } from "react";
 
-          <div className="hidden items-end space-x-6 md:flex md:absolute md:left-1/2 md:-translate-x-1/2">
-            <a
-              className="font-mono text-sm text-gray-900 hover:text-blue-600 transition-colors"
-              href="/"
-            >
-              LIVE
-            </a>
-            <span className="text-gray-900">|</span>
-            <span
-              className="font-mono text-sm text-gray-400 cursor-not-allowed relative group"
-            >
-              LEADERBOARD
-              <span className="absolute left-1/2 -translate-x-1/2 top-full mb-2 hidden group-hover:block px-2 py-1 text-xs text-white bg-gray-800 rounded shadow-lg whitespace-nowrap">
-                Coming soon
-              </span>
-            </span>
-            <span className="text-gray-900">|</span>
-            <span
-              className="font-mono text-sm text-gray-400 cursor-not-allowed relative group"
-            >
-              BLOG
-              <span className="absolute left-1/2 -translate-x-1/2 top-full mb-2 hidden group-hover:block px-2 py-1 text-xs text-white bg-gray-800 rounded shadow-lg whitespace-nowrap">
-                Coming soon
-              </span>
-            </span>
-          </div>
+const BACKEND_URL = "http://localhost:3000";
+
+type Stats = {
+  totalTrades: number;
+  currentValue: number;
+  startingValue: number;
+  pnl: number;
+};
+
+export default function Navbar() {
+  const [stats, setStats] = useState<Stats | null>(null);
+
+  const fetchStats = useCallback(async () => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/stats`);
+      const data: Stats = await res.json();
+      setStats(data);
+    } catch (err) {
+      console.error("Failed to fetch stats:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchStats();
+    const interval = setInterval(fetchStats, 30_000);
+    return () => clearInterval(interval);
+  }, [fetchStats]);
+
+  const pnlPositive = stats ? stats.pnl >= 0 : true;
+
+  return (
+    <nav className="border-b border-terminal-border bg-terminal-surface">
+      <div className="flex h-12 items-center justify-between px-4">
+        <div className="flex items-center gap-3">
+          <span className="text-lg font-bold tracking-wider text-terminal-green">
+            TRADIO
+          </span>
+          <span className="h-4 w-px bg-terminal-border" />
+          <span className="text-xs text-terminal-muted">LIVE</span>
+          <span className="relative flex h-2 w-2">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-terminal-green opacity-40" />
+            <span className="relative inline-flex h-2 w-2 rounded-full bg-terminal-green" />
+          </span>
         </div>
+
+        {stats && (
+          <div className="flex items-center gap-6 font-mono text-sm">
+            <div className="flex items-center gap-2">
+              <span className="text-terminal-muted text-xs">PORTFOLIO</span>
+              <span className="text-terminal-text font-semibold">
+                ${stats.currentValue.toFixed(2)}
+              </span>
+            </div>
+            <span className="h-4 w-px bg-terminal-border" />
+            <div className="flex items-center gap-2">
+              <span className="text-terminal-muted text-xs">P&L</span>
+              <span
+                className={`font-semibold ${pnlPositive ? "text-terminal-green" : "text-terminal-red"}`}
+              >
+                {pnlPositive ? "+" : ""}${stats.pnl.toFixed(2)}
+              </span>
+            </div>
+            <span className="h-4 w-px bg-terminal-border" />
+            <div className="flex items-center gap-2">
+              <span className="text-terminal-muted text-xs">TRADES</span>
+              <span className="text-terminal-text font-semibold">
+                {stats.totalTrades}
+              </span>
+            </div>
+          </div>
+        )}
       </div>
     </nav>
   );

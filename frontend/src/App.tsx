@@ -1,45 +1,67 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import PerformanceChart from "./components/PerformanceChart";
 import RecentInvocations from "./components/RecentInvocations";
+import PositionsPanel from "./components/PositionsPanel";
 import Navbar from "./components/Navbar";
+import StatusBar from "./components/StatusBar";
 
 const BACKEND_URL = "http://localhost:3000";
+const POLL_INTERVAL = 30_000;
+
+type PerformanceItem = {
+  createdAt: string;
+  model?: { name?: string };
+  modelId?: string;
+  netPortfolio: string | number;
+};
+
+type Invocation = {
+  id: string;
+  response: string;
+  createdAt: string | Date;
+  model?: { name?: string };
+  toolCalls?: {
+    toolCallType: string;
+    metadata: string;
+    createdAt: string | Date;
+  }[];
+};
+
+type Position = {
+  symbol: string;
+  side: "LONG" | "SHORT";
+  size: number;
+  entryPrice: number;
+  markPrice: number;
+  unrealizedPnl: number;
+};
+
+type Stats = {
+  totalTrades: number;
+  currentValue: number;
+  startingValue: number;
+  pnl: number;
+};
 
 function ChartSkeleton() {
   return (
-    <div className="relative w-full flex flex-1 border-r-2 border-black">
-      <div className="absolute left-1/2 top-2 -translate-x-1/2 z-10">
-        <div className="h-4 w-48 rounded bg-gray-300 animate-pulse" />
+    <div className="flex flex-1 flex-col border-r border-terminal-border bg-terminal-bg">
+      <div className="px-4 pt-3 pb-1">
+        <div className="h-3 w-32 rounded bg-terminal-panel animate-pulse" />
       </div>
-      <div className="w-full h-full flex items-center justify-center p-8">
-        <div className="w-full h-full rounded bg-linear-to-br from-gray-100 to-gray-200 animate-pulse" />
+      <div className="flex-1 flex items-center justify-center p-8">
+        <div className="w-full h-full rounded bg-terminal-panel animate-pulse" />
       </div>
     </div>
   );
 }
 
-function ListSkeleton() {
+function PanelSkeleton() {
   return (
-    <div className="hidden md:block md:w-[280px] lg:w-[320px] xl:w-[380px] 2xl:w-[500px] shrink-0 bg-surface md:overflow-hidden">
-      <div className="flex h-full flex-col gap-4 overflow-y-auto p-2">
-        {Array.from({ length: 8 }).map((_, i) => (
-          <div key={i} className="px-2 py-2">
-            <div className="flex space-x-2">
-              <div className="flex-1">
-                <div className="flex justify-between items-center mb-1">
-                  <div className="h-4 w-24 rounded bg-gray-300 animate-pulse" />
-                  <div className="h-3 w-20 rounded bg-gray-200 animate-pulse" />
-                </div>
-                <div className="rounded p-3 border border-gray-200 bg-gray-50">
-                  <div className="space-y-2">
-                    <div className="h-3 w-full rounded bg-gray-200 animate-pulse" />
-                    <div className="h-3 w-5/6 rounded bg-gray-200 animate-pulse" />
-                    <div className="h-3 w-4/6 rounded bg-gray-200 animate-pulse" />
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
+    <div className="flex w-[360px] flex-col bg-terminal-bg">
+      <div className="p-4 space-y-3">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <div key={i} className="h-10 rounded bg-terminal-panel animate-pulse" />
         ))}
       </div>
     </div>
@@ -47,63 +69,83 @@ function ListSkeleton() {
 }
 
 export default function App() {
-  const [performanceData, setPerformanceData] = useState<any>(null);
+  const [performanceData, setPerformanceData] = useState<
+    PerformanceItem[] | null
+  >(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [invocationsData, setInvocationsData] = useState<any[] | null>(null);
+  const [invocationsData, setInvocationsData] = useState<
+    Invocation[] | null
+  >(null);
+  const [positions, setPositions] = useState<Position[]>([]);
+  const [stats, setStats] = useState<Stats | null>(null);
+
+  const fetchAll = useCallback(async () => {
+    try {
+      const [perfRes, invocRes, posRes, statsRes] = await Promise.allSettled([
+        fetch(`${BACKEND_URL}/performance`),
+        fetch(`${BACKEND_URL}/invocations?limit=30`),
+        fetch(`${BACKEND_URL}/positions`),
+        fetch(`${BACKEND_URL}/stats`),
+      ]);
+
+      if (perfRes.status === "fulfilled" && perfRes.value.ok) {
+        const perfData = await perfRes.value.json();
+        setPerformanceData(perfData.data);
+        setLastUpdated(
+          perfData.lastUpdated ? new Date(perfData.lastUpdated) : new Date()
+        );
+      }
+
+      if (invocRes.status === "fulfilled" && invocRes.value.ok) {
+        const invocData = await invocRes.value.json();
+        setInvocationsData(invocData.data);
+      }
+
+      if (posRes.status === "fulfilled" && posRes.value.ok) {
+        const posData = await posRes.value.json();
+        setPositions(posData.data ?? []);
+      }
+
+      if (statsRes.status === "fulfilled" && statsRes.value.ok) {
+        const statsData = await statsRes.value.json();
+        setStats(statsData);
+      }
+    } catch (err) {
+      console.error("Error fetching data:", err);
+    }
+  }, []);
 
   useEffect(() => {
-    async function fetchData() {
-      try {
-        const perfRes = await fetch(`${BACKEND_URL}/performance`);
-        const perfData = await perfRes.json();
-        setPerformanceData(perfData.data);
-        setLastUpdated(perfData.lastUpdated);
-
-        const invocRes = await fetch(`${BACKEND_URL}/invocations?limit=30`);
-        const invocData = await invocRes.json();
-        setInvocationsData(invocData.data);
-      } catch (err) {
-        console.error("Error fetching data:", err);
-      }
-    }
-
-    fetchData();
-    const interval = setInterval(fetchData, 3 * 60 * 1000);
-
+    fetchAll();
+    const interval = setInterval(fetchAll, POLL_INTERVAL);
     return () => clearInterval(interval);
-  }, []);
+  }, [fetchAll]);
 
   const loading = !performanceData || !invocationsData;
 
   return (
-    <div className="h-screen flex flex-col overflow-hidden bg-linear-to-b from-gray-50 to-gray-100 text-gray-900 font-[system-ui]">
+    <div className="h-screen flex flex-col overflow-hidden bg-terminal-bg text-terminal-text font-mono">
       <Navbar />
-      <div className="flex min-h-0 flex-1 flex-col md:flex-row overflow-y-auto md:overflow-hidden">
+      <div className="flex min-h-0 flex-1">
         {loading ? (
           <>
             <ChartSkeleton />
-            <ListSkeleton />
+            <PanelSkeleton />
           </>
         ) : (
           <>
             <PerformanceChart data={performanceData} />
-            <RecentInvocations data={invocationsData} />
+            <div className="flex w-[360px] shrink-0 flex-col bg-terminal-bg border-l border-terminal-border overflow-hidden">
+              <PositionsPanel positions={positions} />
+              <RecentInvocations data={invocationsData} />
+            </div>
           </>
         )}
       </div>
-      {lastUpdated && (
-        <div className="py-2 text-sm text-center text-gray-500 border-t-2 border-black">
-          Last updated:{" "}
-          <span className="font-medium text-gray-700">
-            {new Date(lastUpdated).toLocaleString("en-US", {
-              month: "short",
-              day: "numeric",
-              hour: "2-digit",
-              minute: "2-digit",
-            })}
-          </span>
-        </div>
-      )}
+      <StatusBar
+        lastUpdated={lastUpdated}
+        totalTrades={stats?.totalTrades ?? 0}
+      />
     </div>
   );
 }
