@@ -24,8 +24,20 @@ export function getAuthToken(): string {
   return cachedToken;
 }
 
-export function fetchH2(url: string, token: string): string {
-  return execSync(
-    `curl -s --http2 -H "Authorization: ${token}" -H "Content-Type: application/json" -H "Accept: application/json" "${url}"`,
-  ).toString();
+// Async HTTP GET against the Lighter API. Uses Bun's native fetch (HTTP/2 capable,
+// non-blocking) so Promise.all actually parallelizes — this is the difference
+// between a ~40s cycle (execSync curl per market) and a ~5s cycle.
+export async function fetchH2(url: string, token: string): Promise<string> {
+  const response = await fetch(url, {
+    headers: {
+      Authorization: token,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Lighter API ${response.status}: ${text.slice(0, 200)}`);
+  }
+  return response.text();
 }

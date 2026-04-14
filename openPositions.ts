@@ -12,7 +12,7 @@ interface Position {
 
 export async function getOpenPositions(apiKey: string, accountIndex: string) {
     const token = getAuthToken();
-    const body = fetchH2(`${BASE_URL}/api/v1/account?by=index&value=${accountIndex}`, token);
+    const body = await fetchH2(`${BASE_URL}/api/v1/account?by=index&value=${accountIndex}`, token);
     const data = JSON.parse(body) as { accounts: Array<{ positions: Position[] }> };
 
     return data.accounts[0]?.positions.map((p) => ({

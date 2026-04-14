@@ -19,11 +19,11 @@ import {
   RISK,
 } from './config';
 
-function getLatestPrice(marketId: number): number {
+async function getLatestPrice(marketId: number): Promise<number> {
   const token = getAuthToken();
   const now = Date.now();
   const url = `${BASE_URL}/api/v1/candles?market_id=${marketId}&resolution=1m&start_timestamp=${now - 300000}&end_timestamp=${now}&count_back=1`;
-  const body = fetchH2(url, token);
+  const body = await fetchH2(url, token);
   const data = JSON.parse(body) as { c: Array<{ c: number }> };
   const price = data.c[data.c.length - 1]?.c;
   if (!price) throw new Error("No latest price found");
@@ -657,7 +657,7 @@ export const invokeAgent = async (account: Account) => {
           const symbol = args.symbol!;
           const side = args.side!;
           const indicators = indicatorBySymbol.get(symbol);
-          const lastPrice = indicators?.lastPrice ?? getLatestPrice(MARKETS[symbol as keyof typeof MARKETS].marketId);
+          const lastPrice = indicators?.lastPrice ?? (await getLatestPrice(MARKETS[symbol as keyof typeof MARKETS].marketId));
           const lastAtr = indicators?.atr14[indicators.atr14.length - 1] ?? 0;
           const leverage = MARKET_LEVERAGE[symbol] ?? 5;
 
@@ -858,7 +858,7 @@ export const invokeAgent = async (account: Account) => {
             continue;
           }
           const market = MARKETS[symbol as keyof typeof MARKETS];
-          const latestPrice = getLatestPrice(market.marketId);
+          const latestPrice = await getLatestPrice(market.marketId);
           const closeSide = pos.sign === "LONG" ? "SHORT" : "LONG";
           const isAsk = closeSide === "SHORT";
           const baseAmount = Math.abs(Math.round(Number(pos.position) * market.qtyDecimals));

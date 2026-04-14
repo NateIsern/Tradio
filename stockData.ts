@@ -29,14 +29,14 @@ const RESOLUTION_HOURS: Record<string, number> = {
     "1d": 24 * 200,
 };
 
-function fetchCandles(marketId: number, resolution: string, count: number): CandleRaw[] {
+async function fetchCandles(marketId: number, resolution: string, count: number): Promise<CandleRaw[]> {
     const now = Date.now();
     const hours = RESOLUTION_HOURS[resolution] ?? 96;
     const start = now - 1000 * 60 * 60 * hours;
     const token = getAuthToken();
 
     const url = `${BASE_URL}/api/v1/candles?market_id=${marketId}&resolution=${resolution}&start_timestamp=${start}&end_timestamp=${now}&count_back=${count}`;
-    const body = fetchH2(url, token);
+    const body = await fetchH2(url, token);
     const data = JSON.parse(body) as { c: CandleRaw[] };
     return data.c ?? [];
 }
@@ -64,7 +64,7 @@ export async function getIndicators(
     duration: "5m" | "4h" | "1h" | "1d",
     marketId: number,
 ): Promise<IndicatorResult> {
-    const candles = fetchCandles(marketId, duration, 50);
+    const candles = await fetchCandles(marketId, duration, 50);
     const midPrices = getMidPrices(candles);
     const highs = candles.map(c => c.h);
     const lows = candles.map(c => c.l);

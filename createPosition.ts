@@ -4,11 +4,11 @@ import { BASE_URL } from "./config";
 import { MARKETS } from "./markets";
 import { getAuthToken, fetchH2 } from "./auth";
 
-function getLatestPrice(marketId: number): number {
+async function getLatestPrice(marketId: number): Promise<number> {
     const token = getAuthToken();
     const now = Date.now();
     const url = `${BASE_URL}/api/v1/candles?market_id=${marketId}&resolution=1m&start_timestamp=${now - 300000}&end_timestamp=${now}&count_back=1`;
-    const body = fetchH2(url, token);
+    const body = await fetchH2(url, token);
     const data = JSON.parse(body) as { c: Array<{ c: number }> };
     const price = data.c[data.c.length - 1]?.c;
     if (!price) throw new Error("No latest price found");
@@ -17,7 +17,7 @@ function getLatestPrice(marketId: number): number {
 
 export async function createPosition(account: Account, symbol: string, side: "LONG" | "SHORT", quantity: number) {
     const market = MARKETS[symbol as keyof typeof MARKETS];
-    const latestPrice = getLatestPrice(market.marketId);
+    const latestPrice = await getLatestPrice(market.marketId);
     const price = Math.round((side === "LONG" ? latestPrice * 1.01 : latestPrice * 0.99) * market.priceDecimals);
     const baseAmount = Math.round(quantity * market.qtyDecimals);
     const isAsk = side === "LONG" ? "false" : "true";

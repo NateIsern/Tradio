@@ -86,7 +86,7 @@ app.get("/positions", async (_req, res) => {
     const token = getAuthToken();
     const accountIndex = process.env.ACCOUNT_INDEX ?? "0";
     const url = `${BASE_URL}/api/v1/account?by=index&value=${accountIndex}`;
-    const raw = fetchH2(url, token);
+    const raw = await fetchH2(url, token);
     const account = JSON.parse(raw);
     const positions: Array<{
       symbol: string;
@@ -99,7 +99,7 @@ app.get("/positions", async (_req, res) => {
     }> = [];
 
     const acct = account.accounts?.[0];
-    const markPrices = fetchLiveMarkPrices();
+    const markPrices = await fetchLiveMarkPrices();
 
     if (acct?.positions && Array.isArray(acct.positions)) {
       for (const pos of acct.positions) {
@@ -209,7 +209,7 @@ app.get("/risk-stats", async (_req, res) => {
     try {
       const token = getAuthToken();
       const accountIndex = model.accountIndex;
-      const raw = fetchH2(`${BASE_URL}/api/v1/account?by=index&value=${accountIndex}`, token);
+      const raw = await fetchH2(`${BASE_URL}/api/v1/account?by=index&value=${accountIndex}`, token);
       const parsed = JSON.parse(raw) as { accounts?: Array<{ positions?: Array<{ position?: string }> }> };
       const positions = parsed.accounts?.[0]?.positions ?? [];
       openPositionsCount = positions.filter((p) => Number(p.position ?? 0) !== 0).length;
@@ -276,31 +276,35 @@ async function refreshMarketPrices() {
   marketPricesRefreshInFlight = true;
   try {
     const token = getAuthToken();
-    const results: Record<string, MarketPriceEntry> = {};
-
     const now = Date.now();
-    for (const [symbol, market] of Object.entries(MARKETS)) {
-      try {
-        const url = `${BASE_URL}/api/v1/candles?market_id=${market.marketId}&resolution=1h&start_timestamp=${now - 86400000}&end_timestamp=${now}&count_back=25`;
-        const raw = fetchH2(url, token);
-        const data = JSON.parse(raw) as { c?: Array<{ o: number; c: number; h: number; l: number }> };
-        const candles = data.c;
 
-        if (candles && candles.length > 0) {
+    // Parallelize across markets — real async fetch makes this ~15x faster.
+    const entries = await Promise.all(
+      Object.entries(MARKETS).map(async ([symbol, market]) => {
+        try {
+          const url = `${BASE_URL}/api/v1/candles?market_id=${market.marketId}&resolution=1h&start_timestamp=${now - 86400000}&end_timestamp=${now}&count_back=25`;
+          const raw = await fetchH2(url, token);
+          const data = JSON.parse(raw) as { c?: Array<{ o: number; c: number; h: number; l: number }> };
+          const candles = data.c;
+          if (!candles || candles.length === 0) return null;
           const latest = candles[candles.length - 1];
+          if (!latest) return null;
           const currentPrice = latest.c;
           let change24h = 0;
           if (candles.length >= 2) {
-            const oldPrice = candles[0].c;
-            if (oldPrice > 0) {
-              change24h = ((currentPrice - oldPrice) / oldPrice) * 100;
-            }
+            const oldPrice = candles[0]?.c ?? 0;
+            if (oldPrice > 0) change24h = ((currentPrice - oldPrice) / oldPrice) * 100;
           }
-          results[symbol] = { price: currentPrice, change24h };
+          return [symbol, { price: currentPrice, change24h }] as const;
+        } catch {
+          return null;
         }
-      } catch (err) {
-        // skip failed markets silently
-      }
+      }),
+    );
+
+    const results: Record<string, MarketPriceEntry> = {};
+    for (const entry of entries) {
+      if (entry) results[entry[0]] = entry[1];
     }
 
     marketPricesCache = results;
@@ -405,31 +409,36 @@ type EnrichedPosition = {
   markPrice?: number;
 };
 
-function fetchLiveMarkPrices(): Record<string, number> {
+async function fetchLiveMarkPrices(): Promise<Record<string, number>> {
   const out: Record<string, number> = {};
   const token = getAuthToken();
   const now = Date.now();
-  for (const [symbol, market] of Object.entries(MARKETS)) {
-    try {
-      const url = `${BASE_URL}/api/v1/candles?market_id=${market.marketId}&resolution=1m&start_timestamp=${now - 300000}&end_timestamp=${now}&count_back=1`;
-      const raw = fetchH2(url, token);
-      const data = JSON.parse(raw) as { c?: Array<{ c: number }> };
-      const last = data.c?.[data.c.length - 1]?.c;
-      if (typeof last === "number") out[symbol] = last;
-    } catch {
-      // ignore
-    }
+  const entries = await Promise.all(
+    Object.entries(MARKETS).map(async ([symbol, market]) => {
+      try {
+        const url = `${BASE_URL}/api/v1/candles?market_id=${market.marketId}&resolution=1m&start_timestamp=${now - 300000}&end_timestamp=${now}&count_back=1`;
+        const raw = await fetchH2(url, token);
+        const data = JSON.parse(raw) as { c?: Array<{ c: number }> };
+        const last = data.c?.[data.c.length - 1]?.c;
+        return typeof last === "number" ? ([symbol, last] as const) : null;
+      } catch {
+        return null;
+      }
+    }),
+  );
+  for (const entry of entries) {
+    if (entry) out[entry[0]] = entry[1];
   }
   return out;
 }
 
-function fetchHistoricalPrice(marketId: number, timestampMs: number): number | null {
+async function fetchHistoricalPrice(marketId: number, timestampMs: number): Promise<number | null> {
   const token = getAuthToken();
   const start = timestampMs - 5 * 60 * 1000;
   const end = timestampMs + 5 * 60 * 1000;
   try {
     const url = `${BASE_URL}/api/v1/candles?market_id=${marketId}&resolution=1m&start_timestamp=${start}&end_timestamp=${end}&count_back=2`;
-    const raw = fetchH2(url, token);
+    const raw = await fetchH2(url, token);
     const data = JSON.parse(raw) as { c?: Array<{ o: number; c: number }> };
     const candle = data.c?.[0];
     if (!candle) return null;
@@ -450,7 +459,7 @@ async function buildLiveContext(modelId: string): Promise<string> {
     const token = getAuthToken();
     const accountIndex = process.env.ACCOUNT_INDEX ?? "0";
     const url = `${BASE_URL}/api/v1/account?by=index&value=${accountIndex}`;
-    const raw = fetchH2(url, token);
+    const raw = await fetchH2(url, token);
     const account = JSON.parse(raw) as {
       accounts?: Array<{
         collateral?: string;
@@ -525,8 +534,8 @@ async function buildLiveContext(modelId: string): Promise<string> {
     }
   }
 
-  // Live mark prices for each market
-  const markPrices = fetchLiveMarkPrices();
+  // Live mark prices for each market (parallelized internally)
+  const markPrices = await fetchLiveMarkPrices();
 
   // Enrich positions with entry info + mark price
   for (const p of livePositions) {
@@ -542,7 +551,7 @@ async function buildLiveContext(modelId: string): Promise<string> {
         } else {
           const market = MARKETS[p.symbol as keyof typeof MARKETS];
           if (market) {
-            const inferred = fetchHistoricalPrice(
+            const inferred = await fetchHistoricalPrice(
               market.marketId,
               entry.ts.getTime(),
             );
