@@ -3,7 +3,7 @@ import PerformanceChart from "./components/PerformanceChart";
 import RecentInvocations from "./components/RecentInvocations";
 import Navbar from "./components/Navbar";
 
-const BACKEND_URL = "https://api.ai-trading.100xdevs.com";
+const BACKEND_URL = "http://localhost:3000";
 
 function ChartSkeleton() {
   return (

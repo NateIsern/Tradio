@@ -1,10 +1,19 @@
 {
-  "name": "ai-trading-bot",
+  "name": "tradio",
   "module": "index.ts",
   "type": "module",
   "private": true,
+  "scripts": {
+    "start": "bun run start.ts",
+    "bot": "bun run index.ts",
+    "api": "bun run backend.ts",
+    "dashboard": "cd frontend && bun run dev",
+    "seed": "bun run seed.ts",
+    "prisma:generate": "bunx prisma generate"
+  },
   "devDependencies": {
     "@types/bun": "latest",
+    "baseline-browser-mapping": "^2.10.18",
     "mongodb": "^7.1.1"
   },
   "peerDependencies": {
