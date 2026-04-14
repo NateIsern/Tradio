@@ -103,18 +103,20 @@ export async function getIndicators(
     const lastAtr = atr14[atr14.length - 1] ?? 0;
     const atrPct = lastPrice > 0 ? lastAtr / lastPrice : 0;
 
+    // Return last 5 bars instead of 10 — halves the per-market payload sent
+    // to the LLM, cutting input-token processing by ~30-40% per cycle.
     return {
-        midPrices: midPrices.slice(-10).map(x => Number(x.toFixed(3))),
-        macd: macd.slice(-10).map(x => Number(x.toFixed(3))),
-        ema20s: ema20s.slice(-10).map(x => Number(x.toFixed(3))),
-        rsi: rsi.slice(-10).map(x => Number(x.toFixed(1))),
+        midPrices: midPrices.slice(-5).map(x => Number(x.toFixed(3))),
+        macd: macd.slice(-5).map(x => Number(x.toFixed(3))),
+        ema20s: ema20s.slice(-5).map(x => Number(x.toFixed(3))),
+        rsi: rsi.slice(-5).map(x => Number(x.toFixed(1))),
         bollingerBands: {
-            upper: bb.upper.slice(-10).map(x => Number(x.toFixed(3))),
-            middle: bb.middle.slice(-10).map(x => Number(x.toFixed(3))),
-            lower: bb.lower.slice(-10).map(x => Number(x.toFixed(3))),
+            upper: bb.upper.slice(-5).map(x => Number(x.toFixed(3))),
+            middle: bb.middle.slice(-5).map(x => Number(x.toFixed(3))),
+            lower: bb.lower.slice(-5).map(x => Number(x.toFixed(3))),
         },
-        atr14: atr14.slice(-10).map(x => Number(x.toFixed(4))),
-        adx14: adxResult.adx.slice(-10).map(x => Number(x.toFixed(1))),
+        atr14: atr14.slice(-5).map(x => Number(x.toFixed(4))),
+        adx14: adxResult.adx.slice(-5).map(x => Number(x.toFixed(1))),
         lastPrice,
         lastHigh: highs[highs.length - 1] ?? 0,
         lastLow: lows[lows.length - 1] ?? 0,

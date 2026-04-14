@@ -1,5 +1,21 @@
-import { execSync } from 'child_process';
 import { PROMPT } from './prompt';
+
+// Async wrapper around `python3 trade.py ...` — lets us parallelize tool
+// execution via Promise.all instead of blocking the event loop per call.
+async function runTradePy(args: string[]): Promise<string> {
+  const proc = Bun.spawn(["python3", "trade.py", ...args], {
+    cwd: import.meta.dir,
+    env: process.env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [out] = await Promise.all([
+    new Response(proc.stdout).text(),
+    proc.exited,
+  ]);
+  return out.trim();
+}
+
 import { type Account } from './accounts';
 import { getIndicators, type IndicatorResult } from './stockData';
 import { getOpenPositions } from './openPositions';
@@ -321,12 +337,15 @@ async function placeAutoStopLoss(
   const baseAmount = Math.abs(Math.round(quantity * market.qtyDecimals));
 
   try {
-    const result = execSync(
-      `python3 trade.py stop_loss ${market.marketId} ${market.clientOrderIndex} ${baseAmount} ${triggerPriceInt} ${execPriceInt} ${isAsk}`,
-      { cwd: import.meta.dir, env: process.env },
-    )
-      .toString()
-      .trim();
+    const result = await runTradePy([
+      "stop_loss",
+      String(market.marketId),
+      String(market.clientOrderIndex),
+      String(baseAmount),
+      String(triggerPriceInt),
+      String(execPriceInt),
+      String(isAsk),
+    ]);
     const parsed = JSON.parse(result) as { error?: string };
     if (parsed.error) return { ok: false, error: parsed.error, stopPrice };
     return { ok: true, stopPrice };
@@ -403,12 +422,17 @@ function validateToolArgs(
 // --- Main agent loop ---
 
 export const invokeAgent = async (account: Account) => {
+  const t0 = Date.now();
+  const mark = (label: string) => console.log(`[timing] ${label}: ${((Date.now() - t0) / 1000).toFixed(2)}s`);
+
   const portfolio = await getPortfolio(account);
   const equity = Number(portfolio.total);
   const availableCash = Number(portfolio.available);
+  mark("portfolio");
 
   // Halt check first — do not waste LLM budget on a halted account.
   const breaker = await checkCircuitBreakers(account.id, equity);
+  mark("circuit-breakers");
   if (breaker.halted) {
     console.log(`[HALT] ${account.name}: ${breaker.reason}`);
     if (breaker.hard) {
@@ -476,8 +500,10 @@ export const invokeAgent = async (account: Account) => {
 
     `;
   }));
+  mark("indicators");
 
   const openPositions = await getOpenPositions(account.apiKey, account.accountIndex);
+  mark("open-positions");
   const modelInvocation = await prisma.invocations.create({
     data: { modelId: account.id, response: "" },
   });
@@ -630,7 +656,9 @@ export const invokeAgent = async (account: Account) => {
     },
   ];
 
+  mark("prompt-built");
   const choice = await callDOChat(account.modelName, [{ role: "user", content: enrichedPrompt }], tools);
+  mark("llm-call");
   let responseText = choice.message.content ?? "";
 
   const seenInCycle = new Set<string>();
@@ -719,10 +747,14 @@ export const invokeAgent = async (account: Account) => {
               const isAsk = closeSide === "SHORT";
               const baseAmount = Math.abs(Math.round(decision.approvedQuantity * market.qtyDecimals));
               const closePrice = Math.round((side === "LONG" ? lastPrice * 0.99 : lastPrice * 1.01) * market.priceDecimals);
-              execSync(
-                `python3 trade.py close_position ${market.marketId} ${market.clientOrderIndex} ${baseAmount} ${closePrice} ${isAsk}`,
-                { cwd: import.meta.dir, env: process.env },
-              );
+              await runTradePy([
+                "close_position",
+                String(market.marketId),
+                String(market.clientOrderIndex),
+                String(baseAmount),
+                String(closePrice),
+                String(isAsk),
+              ]);
               responseText += ` [EMERGENCY CLOSE ${symbol}: SL failed "${slResult.error}"]`;
             } catch (closeErr) {
               responseText += ` [CRITICAL ${symbol}: SL AND close failed — ${(closeErr as Error).message}]`;
@@ -815,10 +847,14 @@ export const invokeAgent = async (account: Account) => {
           const limitPrice = Math.round((args.price ?? 0) * market.priceDecimals);
           const baseAmount = Math.round(decision.approvedQuantity * market.qtyDecimals);
           const isAsk = side === "SHORT";
-          const result = execSync(
-            `python3 trade.py limit_order ${market.marketId} ${market.clientOrderIndex} ${baseAmount} ${limitPrice} ${isAsk}`,
-            { cwd: import.meta.dir, env: process.env },
-          ).toString().trim();
+          const result = await runTradePy([
+            "limit_order",
+            String(market.marketId),
+            String(market.clientOrderIndex),
+            String(baseAmount),
+            String(limitPrice),
+            String(isAsk),
+          ]);
           const parsed = JSON.parse(result) as { error?: string };
           if (parsed.error) throw new Error(parsed.error);
           await prisma.toolCalls.create({
@@ -865,10 +901,14 @@ export const invokeAgent = async (account: Account) => {
           const price = Math.round(
             (closeSide === "LONG" ? latestPrice * 1.01 : latestPrice * 0.99) * market.priceDecimals,
           );
-          const result = execSync(
-            `python3 trade.py close_position ${market.marketId} ${market.clientOrderIndex} ${baseAmount} ${price} ${isAsk}`,
-            { cwd: import.meta.dir, env: process.env },
-          ).toString().trim();
+          const result = await runTradePy([
+            "close_position",
+            String(market.marketId),
+            String(market.clientOrderIndex),
+            String(baseAmount),
+            String(price),
+            String(isAsk),
+          ]);
           const parsed = JSON.parse(result) as { error?: string };
           if (parsed.error) throw new Error(parsed.error);
           await prisma.toolCalls.create({
@@ -927,10 +967,15 @@ export const invokeAgent = async (account: Account) => {
           const baseAmount = Math.abs(Math.round(Number(pos.position) * market.qtyDecimals));
           const isAsk = pos.sign === "LONG";
           const action = fn === "setStopLoss" ? "stop_loss" : "take_profit";
-          const result = execSync(
-            `python3 trade.py ${action} ${market.marketId} ${market.clientOrderIndex} ${baseAmount} ${triggerPriceInt} ${execPriceInt} ${isAsk}`,
-            { cwd: import.meta.dir, env: process.env },
-          ).toString().trim();
+          const result = await runTradePy([
+            action,
+            String(market.marketId),
+            String(market.clientOrderIndex),
+            String(baseAmount),
+            String(triggerPriceInt),
+            String(execPriceInt),
+            String(isAsk),
+          ]);
           const parsed = JSON.parse(result) as { error?: string };
           if (parsed.error) throw new Error(parsed.error);
           await prisma.toolCalls.create({
@@ -949,6 +994,7 @@ export const invokeAgent = async (account: Account) => {
     }
   }
 
+  mark("tools-executed");
   console.log("AI response:", responseText);
 
   await prisma.models.update({
@@ -959,6 +1005,7 @@ export const invokeAgent = async (account: Account) => {
     where: { id: modelInvocation.id },
     data: { response: responseText.trim() },
   });
+  mark("total");
   return responseText;
 };
 
