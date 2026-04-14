@@ -9,6 +9,18 @@ import { createPosition } from './createPosition';
 import { cancelAllOrders } from './cancelOrder';
 import { PrismaClient, ToolCallType } from './generated/prisma/client';
 import { getPortfolio } from './getPortfolio';
+import { getAuthToken, fetchH2 } from './auth';
+
+function getLatestPrice(marketId: number): number {
+  const token = getAuthToken();
+  const now = Date.now();
+  const url = `${BASE_URL}/api/v1/candles?market_id=${marketId}&resolution=1m&start_timestamp=${now - 300000}&end_timestamp=${now}&count_back=1`;
+  const body = fetchH2(url, token);
+  const data = JSON.parse(body) as { c: Array<{ c: number }> };
+  const price = data.c[data.c.length - 1]?.c;
+  if (!price) throw new Error("No latest price found");
+  return price;
+}
 const prisma = new PrismaClient();
 
 interface ChatMessage { role: string; content: string }
@@ -123,18 +135,19 @@ export const invokeAgent = async (account: Account) => {
 
   console.log("Calling AI model:", account.modelName);
 
+  const marketSymbols = Object.keys(MARKETS);
   const tools = [
     {
       type: "function",
       function: {
         name: "createPosition",
-        description: "Open a position in the given market",
+        description: "Open a MARKET order (executes immediately at current price)",
         parameters: {
           type: "object",
           properties: {
-            symbol: { type: "string", enum: Object.keys(MARKETS), description: "The market symbol" },
+            symbol: { type: "string", enum: marketSymbols, description: "Market symbol" },
             side: { type: "string", enum: ["LONG", "SHORT"] },
-            amount: { type: "number", description: "Dollar amount to allocate to this trade (e.g. 20 = $20)" },
+            amount: { type: "number", description: "Dollar amount to allocate (e.g. 20 = $20)" },
           },
           required: ["symbol", "side", "amount"],
         },
@@ -143,9 +156,70 @@ export const invokeAgent = async (account: Account) => {
     {
       type: "function",
       function: {
-        name: "closeAllPosition",
-        description: "Close all the currently open positions",
+        name: "limitOrder",
+        description: "Place a LIMIT order at a specific price (executes only when price reaches target)",
+        parameters: {
+          type: "object",
+          properties: {
+            symbol: { type: "string", enum: marketSymbols, description: "Market symbol" },
+            side: { type: "string", enum: ["LONG", "SHORT"] },
+            amount: { type: "number", description: "Dollar amount to allocate" },
+            price: { type: "number", description: "Target price for the limit order" },
+          },
+          required: ["symbol", "side", "amount", "price"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "closePosition",
+        description: "Close a SPECIFIC position by symbol (not all positions)",
+        parameters: {
+          type: "object",
+          properties: {
+            symbol: { type: "string", enum: marketSymbols, description: "Symbol of the position to close" },
+          },
+          required: ["symbol"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "closeAllPositions",
+        description: "Close ALL open positions at once",
         parameters: { type: "object", properties: {} },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "setStopLoss",
+        description: "Set a stop-loss order to limit downside. Triggers when price drops to triggerPrice.",
+        parameters: {
+          type: "object",
+          properties: {
+            symbol: { type: "string", enum: marketSymbols, description: "Symbol of the position" },
+            triggerPrice: { type: "number", description: "Price at which stop-loss triggers" },
+          },
+          required: ["symbol", "triggerPrice"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "setTakeProfit",
+        description: "Set a take-profit order to lock in gains. Triggers when price reaches triggerPrice.",
+        parameters: {
+          type: "object",
+          properties: {
+            symbol: { type: "string", enum: marketSymbols, description: "Symbol of the position" },
+            triggerPrice: { type: "number", description: "Price at which take-profit triggers" },
+          },
+          required: ["symbol", "triggerPrice"],
+        },
       },
     },
   ];
@@ -156,24 +230,100 @@ export const invokeAgent = async (account: Account) => {
   if (choice.message.tool_calls) {
     for (const tc of choice.message.tool_calls) {
       const args = JSON.parse(tc.function.arguments);
-      if (tc.function.name === "createPosition") {
-        const side = args.side as "LONG" | "SHORT";
-        const symbol = args.symbol as string;
-        const amount = Math.min(args.amount ?? 10, parseFloat(portfolio.available));
-        const leverage = MARKET_LEVERAGE[symbol] ?? 5;
-        const quantity = Number((amount * leverage).toFixed(2));
+      const fn = tc.function.name;
+      try {
+        if (fn === "createPosition") {
+          const side = args.side as "LONG" | "SHORT";
+          const symbol = args.symbol as string;
+          const amount = Math.min(args.amount ?? 10, parseFloat(portfolio.available));
+          const leverage = MARKET_LEVERAGE[symbol] ?? 5;
+          const quantity = Number((amount * leverage).toFixed(2));
+          await createPosition(account, symbol, side, quantity);
+          await prisma.toolCalls.create({
+            data: { invocationId: modelInvocation.id, toolCallType: ToolCallType.CREATE_POSITION, metadata: JSON.stringify({ symbol, side, quantity, amount, type: "market" }) },
+          });
+          responseText += ` [MARKET ${side} ${symbol} $${amount} @ ${leverage}x]`;
 
-        await createPosition(account, symbol, side, quantity);
-        await prisma.toolCalls.create({
-          data: { invocationId: modelInvocation.id, toolCallType: ToolCallType.CREATE_POSITION, metadata: JSON.stringify({ symbol, side, quantity, amount }) },
-        });
-        responseText += ` [${side} ${symbol} $${amount} -> ${quantity} units @ ${leverage}x]`;
-      } else if (tc.function.name === "closeAllPosition") {
-        await cancelAllOrders(account);
-        await prisma.toolCalls.create({
-          data: { invocationId: modelInvocation.id, toolCallType: ToolCallType.CLOSE_POSITION, metadata: "" },
-        });
-        responseText += " [Closed all positions]";
+        } else if (fn === "limitOrder") {
+          const side = args.side as "LONG" | "SHORT";
+          const symbol = args.symbol as string;
+          const market = MARKETS[symbol as keyof typeof MARKETS];
+          const amount = Math.min(args.amount ?? 10, parseFloat(portfolio.available));
+          const leverage = MARKET_LEVERAGE[symbol] ?? 5;
+          const quantity = Number((amount * leverage).toFixed(2));
+          const limitPrice = Math.round(args.price * market.priceDecimals);
+          const baseAmount = Math.round(quantity * market.qtyDecimals);
+          const isAsk = side === "SHORT";
+          const result = execSync(
+            `python3 trade.py limit_order ${market.marketId} ${market.clientOrderIndex} ${baseAmount} ${limitPrice} ${isAsk}`,
+            { cwd: import.meta.dir, env: process.env },
+          ).toString().trim();
+          const parsed = JSON.parse(result);
+          if (parsed.error) throw new Error(parsed.error);
+          await prisma.toolCalls.create({
+            data: { invocationId: modelInvocation.id, toolCallType: ToolCallType.CREATE_POSITION, metadata: JSON.stringify({ symbol, side, quantity, amount, price: args.price, type: "limit" }) },
+          });
+          responseText += ` [LIMIT ${side} ${symbol} $${amount} @ $${args.price}]`;
+
+        } else if (fn === "closePosition") {
+          const symbol = args.symbol as string;
+          const pos = openPositions?.find(p => p.symbol === symbol);
+          if (pos && Number(pos.position) !== 0) {
+            const market = MARKETS[symbol as keyof typeof MARKETS];
+            const latestPrice = getLatestPrice(market.marketId);
+            const closeSide = pos.sign === "LONG" ? "SHORT" : "LONG";
+            const isAsk = closeSide === "SHORT";
+            const baseAmount = Math.abs(Math.round(Number(pos.position) * market.qtyDecimals));
+            const price = Math.round((closeSide === "LONG" ? latestPrice * 1.01 : latestPrice * 0.99) * market.priceDecimals);
+            const result = execSync(
+              `python3 trade.py close_position ${market.marketId} ${market.clientOrderIndex} ${baseAmount} ${price} ${isAsk}`,
+              { cwd: import.meta.dir, env: process.env },
+            ).toString().trim();
+            const parsed = JSON.parse(result);
+            if (parsed.error) throw new Error(parsed.error);
+            await prisma.toolCalls.create({
+              data: { invocationId: modelInvocation.id, toolCallType: ToolCallType.CLOSE_POSITION, metadata: JSON.stringify({ symbol }) },
+            });
+            responseText += ` [CLOSED ${symbol}]`;
+          } else {
+            responseText += ` [No open position for ${symbol}]`;
+          }
+
+        } else if (fn === "closeAllPositions") {
+          await cancelAllOrders(account);
+          await prisma.toolCalls.create({
+            data: { invocationId: modelInvocation.id, toolCallType: ToolCallType.CLOSE_POSITION, metadata: JSON.stringify({ type: "close_all" }) },
+          });
+          responseText += " [CLOSED ALL]";
+
+        } else if (fn === "setStopLoss" || fn === "setTakeProfit") {
+          const symbol = args.symbol as string;
+          const pos = openPositions?.find(p => p.symbol === symbol);
+          if (pos && Number(pos.position) !== 0) {
+            const market = MARKETS[symbol as keyof typeof MARKETS];
+            const triggerPrice = Math.round(args.triggerPrice * market.priceDecimals);
+            const slippage = fn === "setStopLoss" ? 0.98 : 1.02;
+            const execPrice = Math.round(args.triggerPrice * slippage * market.priceDecimals);
+            const baseAmount = Math.abs(Math.round(Number(pos.position) * market.qtyDecimals));
+            const isAsk = pos.sign === "LONG";
+            const action = fn === "setStopLoss" ? "stop_loss" : "take_profit";
+            const result = execSync(
+              `python3 trade.py ${action} ${market.marketId} ${market.clientOrderIndex} ${baseAmount} ${triggerPrice} ${execPrice} ${isAsk}`,
+              { cwd: import.meta.dir, env: process.env },
+            ).toString().trim();
+            const parsed = JSON.parse(result);
+            if (parsed.error) throw new Error(parsed.error);
+            await prisma.toolCalls.create({
+              data: { invocationId: modelInvocation.id, toolCallType: ToolCallType.CREATE_POSITION, metadata: JSON.stringify({ symbol, type: action, triggerPrice: args.triggerPrice }) },
+            });
+            responseText += ` [${action.toUpperCase()} ${symbol} @ $${args.triggerPrice}]`;
+          } else {
+            responseText += ` [No open position for ${symbol} to set ${fn}]`;
+          }
+        }
+      } catch (err) {
+        responseText += ` [ERROR ${fn}: ${(err as Error).message}]`;
+        console.error(`Tool ${fn} failed:`, (err as Error).message);
       }
     }
   }
