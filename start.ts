@@ -3,6 +3,7 @@ import path from "path";
 
 const ROOT = import.meta.dir;
 const FRONTEND = path.join(ROOT, "frontend");
+const VENV_PYTHON = path.join(ROOT, ".venv", "bin", "python3");
 
 const procs: { name: string; proc: ChildProcess }[] = [];
 
@@ -51,10 +52,12 @@ console.log("Starting Tradio...\n");
 run("bot", "bun", ["run", "index.ts"]);
 run("api", "bun", ["run", "backend.ts"], ROOT, true);
 run("dashboard", "bun", ["run", "dev"], FRONTEND);
+run("telegram", VENV_PYTHON, ["telegram_bot.py"], ROOT, true);
 
 console.log("  Bot:       running (every 2 min)");
 console.log("  API:       http://localhost:3000");
-console.log("  Dashboard: http://localhost:5173\n");
+console.log("  Dashboard: http://localhost:5173");
+console.log("  Telegram:  @natetradiobot (polling, restart on crash)\n");
 
 process.on("SIGINT", () => {
   console.log("\nShutting down...");
