@@ -105,7 +105,7 @@ let positionsLastUpdated: Date | null = null;
 let positionsRefreshInFlight: Promise<void> | null = null;
 const POSITIONS_TTL_MS = 25_000; // reduce fetch cadence to ease 429s
 
-async function refreshPositions(): Promise<void> {
+function refreshPositions(): Promise<void> {
   if (positionsRefreshInFlight) return positionsRefreshInFlight;
   positionsRefreshInFlight = (async () => {
     try {
