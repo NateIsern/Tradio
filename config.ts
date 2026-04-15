@@ -44,3 +44,10 @@ export const LLM_CONFIG = {
   RETRY_BACKOFF_MS: [1000, 3000, 9000],
   TIMEOUT_MS: 90_000,
 } as const;
+
+// Default token is the new @natetradiobot. Override with TELEGRAM_BOT_TOKEN
+// env var for staging/production. Kept in source because this repo is not
+// public and the bot has no destructive permissions of its own — all trading
+// actions go through the dedicated bot loop with Lighter auth.
+export const TELEGRAM_BOT_TOKEN =
+  process.env['TELEGRAM_BOT_TOKEN'] ?? "8731864765:AAHcLkwX--QiQxvPZzvne7x8GtoT-rarA3w";
