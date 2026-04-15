@@ -1,6 +1,6 @@
 import { execSync } from "child_process";
 import type { Account } from "./accounts";
-import { BASE_URL } from "./config";
+import { BASE_URL, PYTHON } from "./config";
 import { MARKETS } from "./markets";
 import { getAuthToken, fetchH2 } from "./auth";
 
@@ -23,7 +23,7 @@ export async function createPosition(account: Account, symbol: string, side: "LO
     const isAsk = side === "LONG" ? "false" : "true";
 
     const result = execSync(
-        `python3 trade.py create_order ${market.marketId} ${market.clientOrderIndex} ${baseAmount} ${price} ${isAsk} `,
+        `"${PYTHON}" trade.py create_order ${market.marketId} ${market.clientOrderIndex} ${baseAmount} ${price} ${isAsk} `,
         { cwd: import.meta.dir, env: process.env },
     ).toString().trim();
 

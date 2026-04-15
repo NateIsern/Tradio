@@ -29,8 +29,20 @@ const RESOLUTION_HOURS: Record<string, number> = {
     "1d": 24 * 200,
 };
 
+// Snap `now` to the start of the current candle. The bot + backend + /chat
+// all ask for the same candle window within the same bar, so we quantize the
+// URL timestamps to the resolution boundary and the auth.ts response cache
+// collapses all of them into a single Lighter call.
+const RESOLUTION_MS: Record<string, number> = {
+    "5m": 5 * 60 * 1000,
+    "1h": 60 * 60 * 1000,
+    "4h": 4 * 60 * 60 * 1000,
+    "1d": 24 * 60 * 60 * 1000,
+};
+
 async function fetchCandles(marketId: number, resolution: string, count: number): Promise<CandleRaw[]> {
-    const now = Date.now();
+    const resMs = RESOLUTION_MS[resolution] ?? 5 * 60 * 1000;
+    const now = Math.floor(Date.now() / resMs) * resMs;
     const hours = RESOLUTION_HOURS[resolution] ?? 96;
     const start = now - 1000 * 60 * 60 * hours;
     const token = getAuthToken();
@@ -60,7 +72,35 @@ export interface IndicatorResult {
     atrPct: number;      // last ATR as fraction of last price
 }
 
+// Process-level cache for computed indicators. A fresh 5m candle only arrives
+// every 5 minutes, 4h every 4 hours — polling more often than that burns
+// Lighter calls for no information gain. TTL is sized well under the candle
+// period so reactions still land inside the current bar.
+type IndicatorCacheEntry = { at: number; value: Promise<IndicatorResult> };
+const indicatorCache = new Map<string, IndicatorCacheEntry>();
+const INDICATOR_TTL_MS: Record<string, number> = {
+    "5m": 30_000,
+    "1h": 60_000,
+    "4h": 120_000,
+    "1d": 300_000,
+};
+
 export async function getIndicators(
+    duration: "5m" | "4h" | "1h" | "1d",
+    marketId: number,
+): Promise<IndicatorResult> {
+    const key = `${duration}:${marketId}`;
+    const ttl = INDICATOR_TTL_MS[duration] ?? 60_000;
+    const hit = indicatorCache.get(key);
+    if (hit && Date.now() - hit.at < ttl) return hit.value;
+
+    const task = computeIndicators(duration, marketId);
+    indicatorCache.set(key, { at: Date.now(), value: task });
+    task.catch(() => indicatorCache.delete(key));
+    return task;
+}
+
+async function computeIndicators(
     duration: "5m" | "4h" | "1h" | "1d",
     marketId: number,
 ): Promise<IndicatorResult> {

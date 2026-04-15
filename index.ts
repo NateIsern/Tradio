@@ -1,9 +1,10 @@
 import { PROMPT } from './prompt';
+import { PYTHON } from './config';
 
 // Async wrapper around `python3 trade.py ...` — lets us parallelize tool
 // execution via Promise.all instead of blocking the event loop per call.
 async function runTradePy(args: string[]): Promise<string> {
-  const proc = Bun.spawn(["python3", "trade.py", ...args], {
+  const proc = Bun.spawn([PYTHON, "trade.py", ...args], {
     cwd: import.meta.dir,
     env: process.env,
     stdout: "pipe",
@@ -25,6 +26,7 @@ import { cancelAllOrders } from './cancelOrder';
 import { PrismaClient, ToolCallType, HaltType } from './generated/prisma/client';
 import { getPortfolio } from './getPortfolio';
 import { getAuthToken, fetchH2 } from './auth';
+import { sendTelegramAlert } from './telegram';
 import {
   BASE_URL,
   DRY_RUN,
@@ -32,6 +34,9 @@ import {
   LOOP_INTERVAL_MS,
   LOOP_ALIGN_BUFFER_MS,
   LLM_CONFIG,
+  LLM_BASE_URL,
+  LLM_API_KEY,
+  LLM_MODEL_OVERRIDE,
   RISK,
 } from './config';
 
@@ -50,7 +55,11 @@ const prisma = new PrismaClient();
 
 interface ChatMessage { role: string; content: string }
 interface ToolCall { id: string; type: string; function: { name: string; arguments: string } }
-interface ChatChoice { message: { content: string | null; tool_calls?: ToolCall[] }; finish_reason: string }
+interface ChatChoice {
+  message: { content: string | null; tool_calls?: ToolCall[] };
+  finish_reason: string;
+  durationMs?: number;
+}
 
 const MARKET_LEVERAGE: Record<string, number> = {
   BTC: 10,
@@ -70,21 +79,34 @@ const MARKET_LEVERAGE: Record<string, number> = {
   ENA: 10,
 };
 
+const MIN_RR = 1.5; // minimum reward-to-risk enforced by the risk engine
+const TELEGRAM_NOTIFY_COOLDOWN_MS = 5 * 60 * 1000;
+const lastTelegramAt: Record<string, number> = {};
+
 // Native Bun fetch with retry + backoff. Replaces the curl-with-tmpfile hack:
 // removes a file-system race condition between concurrent cycles and gives us
 // real HTTP error handling.
-async function callDOChat(
-  model: string,
+// Native Ollama /api/chat. The OpenAI shim ignores `think` on reasoning
+// models (qwen3.5), so the bot must use the native endpoint to keep chain-of
+// -thought enabled *and* get tool calls with a stable schema.
+async function callLLMChat(
+  _model: string,
   messages: ChatMessage[],
   tools: object[],
 ): Promise<ChatChoice> {
+  const llmStart = Date.now();
+  const ollamaBase = LLM_BASE_URL.replace(/\/v1\/?$/, "");
   const body = JSON.stringify({
-    model,
+    model: LLM_MODEL_OVERRIDE,
     messages,
     tools,
-    max_completion_tokens: LLM_CONFIG.MAX_COMPLETION_TOKENS,
-    temperature: LLM_CONFIG.TEMPERATURE,
-    tool_choice: "auto",
+    stream: false,
+    think: true,
+    keep_alive: "30m",
+    options: {
+      temperature: LLM_CONFIG.TEMPERATURE,
+      num_predict: LLM_CONFIG.MAX_COMPLETION_TOKENS,
+    },
   });
 
   let lastErr: Error | null = null;
@@ -92,29 +114,55 @@ async function callDOChat(
     const controller = new AbortController();
     const timeoutHandle = setTimeout(() => controller.abort(), LLM_CONFIG.TIMEOUT_MS);
     try {
-      const response = await fetch("https://inference.do-ai.run/v1/chat/completions", {
+      const response = await fetch(`${ollamaBase}/api/chat`, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env['DO_MODEL_ACCESS_KEY'] ?? ""}`,
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body,
         signal: controller.signal,
       });
 
       if (!response.ok) {
         const text = await response.text().catch(() => "");
-        throw new Error(`DO API ${response.status}: ${text.slice(0, 300)}`);
+        throw new Error(`LLM API ${response.status}: ${text.slice(0, 300)}`);
       }
 
-      const data = (await response.json()) as {
-        choices?: ChatChoice[];
-        error?: { message: string };
+      type NativeToolCall = {
+        id?: string;
+        function: { name: string; arguments: unknown };
       };
-      if (data.error) throw new Error(data.error.message);
-      const first = data.choices?.[0];
-      if (!first) throw new Error("no choices in DO response");
-      return first;
+      const data = (await response.json()) as {
+        message?: {
+          content?: string | null;
+          thinking?: string | null;
+          tool_calls?: NativeToolCall[];
+        };
+        done_reason?: string;
+        error?: string;
+      };
+      if (data.error) throw new Error(data.error);
+      if (!data.message) throw new Error("no message in LLM response");
+
+      // Ollama returns arguments as a decoded object; the downstream validator
+      // expects a JSON string (OpenAI shape), so normalize here.
+      const normalizedCalls = (data.message.tool_calls ?? []).map((tc, i) => {
+        const args = tc.function.arguments;
+        const argStr = typeof args === "string" ? args : JSON.stringify(args ?? {});
+        return {
+          id: tc.id ?? `call_${i}`,
+          type: "function",
+          function: { name: tc.function.name, arguments: argStr },
+        };
+      });
+
+      return {
+        message: {
+          content: data.message.content ?? null,
+          tool_calls: normalizedCalls.length > 0 ? normalizedCalls : undefined,
+        },
+        finish_reason: data.done_reason ?? "stop",
+        // duration added for telemetry at call-site
+        durationMs: Date.now() - llmStart,
+      };
     } catch (err) {
       lastErr = err as Error;
       if (attempt < LLM_CONFIG.MAX_RETRIES - 1) {
@@ -126,7 +174,7 @@ async function callDOChat(
     }
   }
   throw new Error(
-    `DO API failed after ${LLM_CONFIG.MAX_RETRIES} attempts: ${lastErr?.message ?? "unknown"}`,
+    `LLM API failed after ${LLM_CONFIG.MAX_RETRIES} attempts: ${lastErr?.message ?? "unknown"}`,
   );
 }
 
@@ -139,10 +187,13 @@ interface RiskCheckInput {
   leverage: number;
   lastPrice: number;
   atr: number;
+  adx: number;
+  rsi: number;
   equity: number;
   availableCash: number;
   openPositions: Array<{ symbol: string; position: string; sign: string }>;
   seenInCycle: Set<string>;
+  minRR?: number;
 }
 
 interface RiskCheckResult {
@@ -153,6 +204,7 @@ interface RiskCheckResult {
   approvedQuantity: number;
   atrStopDistance: number;
   stopPrice: number;
+  minTakeProfit?: number;
 }
 
 function riskCheck(input: RiskCheckInput): RiskCheckResult {
@@ -189,6 +241,17 @@ function riskCheck(input: RiskCheckInput): RiskCheckResult {
       return { ...empty, approved: false, reason: `already ${input.side} ${input.symbol} — no pyramiding` };
     }
     return { ...empty, approved: false, reason: `opposite ${existing.sign} on ${input.symbol} — close first` };
+  }
+
+  if (input.adx < RISK.MIN_ADX_FOR_MARKET) {
+    return { ...empty, approved: false, reason: `weak trend (ADX ${input.adx.toFixed(1)} < ${RISK.MIN_ADX_FOR_MARKET})` };
+  }
+
+  if (input.side === "LONG" && input.rsi > RISK.LONG_RSI_MAX) {
+    return { ...empty, approved: false, reason: `RSI ${input.rsi.toFixed(1)} too hot for longs` };
+  }
+  if (input.side === "SHORT" && input.rsi < RISK.SHORT_RSI_MIN) {
+    return { ...empty, approved: false, reason: `RSI ${input.rsi.toFixed(1)} too cold for shorts` };
   }
 
   const rawStopDistance = input.atr > 0
@@ -233,6 +296,25 @@ function riskCheck(input: RiskCheckInput): RiskCheckResult {
   const stopPrice = input.side === "LONG"
     ? input.lastPrice - atrStopDistance
     : input.lastPrice + atrStopDistance;
+
+  // Enforce minimum reward-to-risk when the caller provides a TP heuristic.
+  // With ATR-based stop distance, require at least 1.5R unless overridden.
+  if (input.minRR && input.minRR > 0) {
+    const rr = input.minRR;
+    const tpDistance = atrStopDistance * rr;
+    const minTakeProfit = input.side === "LONG"
+      ? input.lastPrice + tpDistance
+      : input.lastPrice - tpDistance;
+    return {
+      approved: true,
+      capped,
+      approvedAmount: Number(approvedAmount.toFixed(4)),
+      approvedQuantity,
+      atrStopDistance,
+      stopPrice: Number(stopPrice.toFixed(6)),
+      minTakeProfit: Number(minTakeProfit.toFixed(6)),
+    };
+  }
 
   return {
     approved: true,
@@ -332,7 +414,7 @@ async function placeAutoStopLoss(
   // LONG exits via SELL (is_ask=true); SHORT exits via BUY (is_ask=false).
   const isAsk = side === "LONG";
   const triggerPriceInt = Math.round(stopPrice * market.priceDecimals);
-  const execPrice = side === "LONG" ? stopPrice * 0.98 : stopPrice * 1.02;
+  const execPrice = side === "LONG" ? stopPrice * 0.999 : stopPrice * 1.001;
   const execPriceInt = Math.round(execPrice * market.priceDecimals);
   const baseAmount = Math.abs(Math.round(quantity * market.qtyDecimals));
 
@@ -360,6 +442,50 @@ interface NormalizedArgs {
   amount?: number;
   price?: number;
   triggerPrice?: number;
+  mode?: StrategyMode;
+  bias?: StrategyBias;
+  riskTier?: StrategyRiskTier;
+  note?: string;
+}
+
+type StrategyMode = "aggressive" | "balanced" | "defensive" | "cash";
+type StrategyBias = "long" | "short" | "neutral";
+type StrategyRiskTier = "low" | "normal" | "high";
+interface StrategyState {
+  mode: StrategyMode;
+  bias: StrategyBias;
+  riskTier: StrategyRiskTier;
+  note: string;
+}
+const STRATEGY_MODES: StrategyMode[] = ["aggressive", "balanced", "defensive", "cash"];
+const STRATEGY_BIASES: StrategyBias[] = ["long", "short", "neutral"];
+const STRATEGY_TIERS: StrategyRiskTier[] = ["low", "normal", "high"];
+const DEFAULT_STRATEGY: StrategyState = {
+  mode: "balanced",
+  bias: "neutral",
+  riskTier: "normal",
+  note: "initial",
+};
+
+function parseStrategy(raw: string | null | undefined): StrategyState {
+  if (!raw) return { ...DEFAULT_STRATEGY };
+  try {
+    const j = JSON.parse(raw) as Partial<StrategyState>;
+    return {
+      mode: STRATEGY_MODES.includes(j.mode as StrategyMode)
+        ? (j.mode as StrategyMode)
+        : DEFAULT_STRATEGY.mode,
+      bias: STRATEGY_BIASES.includes(j.bias as StrategyBias)
+        ? (j.bias as StrategyBias)
+        : DEFAULT_STRATEGY.bias,
+      riskTier: STRATEGY_TIERS.includes(j.riskTier as StrategyRiskTier)
+        ? (j.riskTier as StrategyRiskTier)
+        : DEFAULT_STRATEGY.riskTier,
+      note: typeof j.note === "string" ? j.note.slice(0, 200) : DEFAULT_STRATEGY.note,
+    };
+  } catch {
+    return { ...DEFAULT_STRATEGY };
+  }
 }
 
 function validateToolArgs(
@@ -416,7 +542,53 @@ function validateToolArgs(
     return { ok: true, args: out };
   }
 
+  if (fn === "notifyTelegram") {
+    const title = parsed['title'];
+    const message = parsed['message'];
+    if (typeof title !== "string" || title.trim().length < 2) {
+      return { ok: false, reason: "title must be a short string" };
+    }
+    if (typeof message !== "string" || message.trim().length < 2) {
+      return { ok: false, reason: "message must be a short string" };
+    }
+    out.note = `${title.slice(0, 100)}|${message.slice(0, 400)}`;
+    return { ok: true, args: out };
+  }
+
   return { ok: false, reason: `unknown tool ${fn}` };
+}
+
+function validateStrategyArgs(
+  raw: string,
+): { ok: true; args: NormalizedArgs } | { ok: false; reason: string } {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return { ok: false, reason: "tool args not valid JSON" };
+  }
+  const out: NormalizedArgs = {};
+  const mode = parsed['mode'];
+  if (typeof mode !== "string" || !STRATEGY_MODES.includes(mode as StrategyMode)) {
+    return { ok: false, reason: `mode must be one of ${STRATEGY_MODES.join("|")}` };
+  }
+  out.mode = mode as StrategyMode;
+  const bias = parsed['bias'];
+  if (typeof bias !== "string" || !STRATEGY_BIASES.includes(bias as StrategyBias)) {
+    return { ok: false, reason: `bias must be one of ${STRATEGY_BIASES.join("|")}` };
+  }
+  out.bias = bias as StrategyBias;
+  const riskTier = parsed['riskTier'];
+  if (typeof riskTier !== "string" || !STRATEGY_TIERS.includes(riskTier as StrategyRiskTier)) {
+    return { ok: false, reason: `riskTier must be one of ${STRATEGY_TIERS.join("|")}` };
+  }
+  out.riskTier = riskTier as StrategyRiskTier;
+  const note = parsed['note'];
+  if (typeof note !== "string" || note.trim().length < 5) {
+    return { ok: false, reason: "note must be a sentence explaining WHY the strategy is changing" };
+  }
+  out.note = note.slice(0, 200);
+  return { ok: true, args: out };
 }
 
 // --- Main agent loop ---
@@ -457,61 +629,93 @@ export const invokeAgent = async (account: Account) => {
     return `[HALTED] ${breaker.reason}`;
   }
 
-  let ALL_INDICATOR_DATA = "";
-  let MARKETS_INFO = "";
   const marketSlugs = Object.keys(MARKETS) as Array<keyof typeof MARKETS>;
   // Keep per-symbol 5m indicators around so the risk engine can read ATR at open time.
   const indicatorBySymbol = new Map<string, IndicatorResult>();
+  const longTermBySymbol = new Map<string, IndicatorResult>();
 
   await Promise.all(marketSlugs.map(async (marketSlug) => {
-    const intradayIndicators = await getIndicators("5m", MARKETS[marketSlug].marketId);
-    const longTermIndicators = await getIndicators("4h", MARKETS[marketSlug].marketId);
+    const [intradayIndicators, longTermIndicators] = await Promise.all([
+      getIndicators("5m", MARKETS[marketSlug].marketId),
+      getIndicators("4h", MARKETS[marketSlug].marketId),
+    ]);
     indicatorBySymbol.set(marketSlug, intradayIndicators);
-    const leverage = MARKET_LEVERAGE[marketSlug] ?? 10;
-    const lastPrice = intradayIndicators.lastPrice;
-    const lastRsi = intradayIndicators.rsi[intradayIndicators.rsi.length - 1] ?? 0;
-    const lastAtr = intradayIndicators.atr14[intradayIndicators.atr14.length - 1] ?? 0;
-    const lastAdx = intradayIndicators.adx14[intradayIndicators.adx14.length - 1] ?? 0;
-    MARKETS_INFO += `${marketSlug}: $${lastPrice} | ${leverage}x | RSI ${lastRsi} | ATR ${lastAtr.toFixed(4)} (${(intradayIndicators.atrPct * 100).toFixed(2)}%) | ADX ${lastAdx.toFixed(1)}\n`;
-
-    ALL_INDICATOR_DATA += `
-    MARKET - ${marketSlug}
-    Intraday (5m candles) (oldest → latest):
-    Mid prices - [${intradayIndicators.midPrices.join(",")}]
-    EMA20 - [${intradayIndicators.ema20s.join(",")}]
-    MACD - [${intradayIndicators.macd.join(",")}]
-    RSI - [${intradayIndicators.rsi.join(",")}]
-    ATR14 - [${intradayIndicators.atr14.join(",")}]
-    ADX14 - [${intradayIndicators.adx14.join(",")}]
-    Bollinger Upper - [${intradayIndicators.bollingerBands.upper.join(",")}]
-    Bollinger Middle - [${intradayIndicators.bollingerBands.middle.join(",")}]
-    Bollinger Lower - [${intradayIndicators.bollingerBands.lower.join(",")}]
-
-    Long Term (4h candles) (oldest → latest):
-    Mid prices - [${longTermIndicators.midPrices.join(",")}]
-    EMA20 - [${longTermIndicators.ema20s.join(",")}]
-    MACD - [${longTermIndicators.macd.join(",")}]
-    RSI - [${longTermIndicators.rsi.join(",")}]
-    ATR14 - [${longTermIndicators.atr14.join(",")}]
-    ADX14 - [${longTermIndicators.adx14.join(",")}]
-    Bollinger Upper - [${longTermIndicators.bollingerBands.upper.join(",")}]
-    Bollinger Middle - [${longTermIndicators.bollingerBands.middle.join(",")}]
-    Bollinger Lower - [${longTermIndicators.bollingerBands.lower.join(",")}]
-
-    `;
+    longTermBySymbol.set(marketSlug, longTermIndicators);
   }));
   mark("indicators");
 
-  const openPositions = await getOpenPositions(account.apiKey, account.accountIndex);
+  // Context budget: only dump full indicator history for markets worth looking
+  // at. "Worth looking at" = either we already hold it (need to manage exit)
+  // or the 5m structure shows a real signal (trending with momentum deviation).
+  // Everything else gets a one-line summary — no arrays, no tail history.
+  const currentOpenPositions = await getOpenPositions(account.apiKey, account.accountIndex);
+  const openPositions = currentOpenPositions;
   mark("open-positions");
+
+  const openSymbols = new Set(
+    (currentOpenPositions ?? []).map((p) => p.symbol).filter((s): s is string => !!s),
+  );
+  const fmt = (n: number, d = 4) =>
+    Number.isFinite(n) ? Number(n.toFixed(d)) : 0;
+  const tail = <T>(arr: T[], n = 3) => arr.slice(-n);
+  const isRelevant = (slug: string, ind: IndicatorResult) => {
+    if (openSymbols.has(slug)) return true;
+    const adx = ind.adx14[ind.adx14.length - 1] ?? 0;
+    const rsi = ind.rsi[ind.rsi.length - 1] ?? 50;
+    return adx >= RISK.MIN_ADX_FOR_MARKET && Math.abs(rsi - 50) >= 12;
+  };
+
+  const blocks: string[] = [];
+  for (const slug of marketSlugs) {
+    const i5 = indicatorBySymbol.get(slug);
+    const i4 = longTermBySymbol.get(slug);
+    if (!i5 || !i4) continue;
+    if (!isRelevant(slug, i5)) continue;
+
+    const bb5u = tail(i5.bollingerBands.upper).map((n) => fmt(n));
+    const bb5l = tail(i5.bollingerBands.lower).map((n) => fmt(n));
+    const bb5m = tail(i5.bollingerBands.middle).map((n) => fmt(n));
+    const pick = (a: number[]) => fmt(a[a.length - 1] ?? 0);
+
+    blocks.push(
+      [
+        `### ${slug}${openSymbols.has(slug) ? " (OPEN)" : ""}`,
+        `5m (last 3): price=[${tail(i5.midPrices).map((n) => fmt(n, 2)).join(",")}] rsi=[${tail(i5.rsi).map((n) => fmt(n, 1)).join(",")}] macd=[${tail(i5.macd).map((n) => fmt(n)).join(",")}] ema20=[${tail(i5.ema20s).map((n) => fmt(n)).join(",")}] adx=${pick(i5.adx14)} atr=${pick(i5.atr14)} bb=[${bb5l[bb5l.length - 1]}..${bb5m[bb5m.length - 1]}..${bb5u[bb5u.length - 1]}] width=${fmt(i5.bbWidth * 100, 2)}% atr%=${fmt(i5.atrPct * 100, 2)}%`,
+        `4h (latest):  price=${pick(i4.midPrices)} rsi=${pick(i4.rsi)} macd=${pick(i4.macd)} ema20=${pick(i4.ema20s)} adx=${pick(i4.adx14)}`,
+      ].join("\n"),
+    );
+  }
+  const ALL_INDICATOR_DATA =
+    blocks.length > 0
+      ? blocks.join("\n\n")
+      : "No markets passing the signal filter this cycle. (Filter: open position OR 5m ADX≥18 AND |RSI-50|≥10.)";
+
   const modelInvocation = await prisma.invocations.create({
-    data: { modelId: account.id, response: "" },
+    data: {
+      modelId: account.id,
+      response: "",
+      equity: equity.toString(),
+      availableCash: availableCash.toString(),
+      openPositions: JSON.stringify(currentOpenPositions ?? []),
+      indicatorsSummary: ALL_INDICATOR_DATA.slice(0, 4000),
+      llmDurationMs: 0, // filled after LLM call
+    },
   });
 
+  // Load current strategy regime. This survives across cycles — the LLM can
+  // flip it with setStrategy when market conditions change.
+  const modelRow = await prisma.models.findUnique({
+    where: { id: account.id },
+    select: { strategyState: true },
+  });
+  const strategy = parseStrategy(modelRow?.strategyState ?? null);
+  const STRATEGY_STATE = `mode=${strategy.mode} | bias=${strategy.bias} | riskTier=${strategy.riskTier} | note="${strategy.note}"`;
+
+  // Context hygiene: only the last 5 cycles (not 10), short one-liners only.
   const recentInvocations = await prisma.invocations.findMany({
     where: { modelId: account.id },
     orderBy: { createdAt: "desc" },
-    take: 10,
+    take: 5,
     include: { toolCalls: true },
   });
   const tradeHistory = recentInvocations.length === 0
@@ -520,48 +724,53 @@ export const invokeAgent = async (account: Account) => {
         .reverse()
         .map((inv) => {
           const actions = inv.toolCalls.length === 0
-            ? "No action taken"
+            ? "no-action"
             : inv.toolCalls.map((tc) => {
                 try {
                   const meta = JSON.parse(tc.metadata) as {
                     symbol?: string;
                     side?: string;
                     amount?: number;
-                    requested?: number;
                     reason?: string;
                     type?: string;
+                    mode?: string;
                   };
                   if (tc.toolCallType === "CREATE_POSITION") {
-                    return `Opened ${meta.side ?? "?"} ${meta.symbol ?? "?"} $${meta.amount ?? "?"}`;
+                    return `${meta.side ?? "?"} ${meta.symbol ?? "?"} $${meta.amount ?? "?"}`;
                   }
-                  if (tc.toolCallType === "CLOSE_POSITION") {
-                    return `Closed ${meta.symbol ?? "all"}`;
-                  }
+                  if (tc.toolCallType === "CLOSE_POSITION") return `CLOSE ${meta.symbol ?? "all"}`;
                   if (tc.toolCallType === "SET_SL") return `SL ${meta.symbol ?? "?"}`;
                   if (tc.toolCallType === "SET_TP") return `TP ${meta.symbol ?? "?"}`;
-                  if (tc.toolCallType === "HALT") return `HALT (${meta.reason ?? "?"})`;
-                  if (tc.toolCallType === "REJECTED") return `REJECTED ${meta.type ?? "?"} ${meta.symbol ?? ""}: ${meta.reason ?? ""}`;
+                  if (tc.toolCallType === "SET_STRATEGY") return `STRAT ${meta.mode ?? "?"}`;
+                  if (tc.toolCallType === "HALT") return `HALT`;
+                  if (tc.toolCallType === "REJECTED") return `REJ ${meta.type ?? "?"}:${meta.reason?.slice(0, 40) ?? ""}`;
                   return tc.toolCallType;
                 } catch {
                   return tc.toolCallType;
                 }
-              }).join("; ");
-          const timestamp = inv.createdAt.toISOString().slice(0, 16).replace("T", " ");
-          const summary = inv.response.length > 160 ? inv.response.slice(0, 160) + "..." : inv.response;
-          return `[${timestamp}] ${actions} | ${summary}`;
+              }).join(";");
+          const timestamp = inv.createdAt.toISOString().slice(11, 16);
+          return `[${timestamp}] ${actions}`;
         })
         .join("\n");
 
   const enrichedPrompt = PROMPT
     .replace("{{INVOKATION_TIMES}}", account.invocationCount.toString())
-    .replace("{{OPEN_POSITIONS}}", openPositions?.map((position) => `${position.symbol} ${position.position} ${position.sign}`).join(", ") ?? "")
+    .replace("{{OPEN_POSITIONS}}", openPositions?.map((position) => `${position.symbol} ${position.position} ${position.sign}`).join(", ") ?? "none")
     .replace("{{PORTFOLIO_VALUE}}", portfolio.total)
     .replace("{{ALL_INDICATOR_DATA}}", ALL_INDICATOR_DATA)
     .replace("{{AVAILABLE_CASH}}", portfolio.available)
     .replace("{{CURRENT_ACCOUNT_VALUE}}", portfolio.total)
-    .replace("{{CURRENT_ACCOUNT_POSITIONS}}", JSON.stringify(openPositions))
+    .replace(
+      "{{CURRENT_ACCOUNT_POSITIONS}}",
+      openPositions && openPositions.length > 0
+        ? openPositions
+            .map((p) => `${p.symbol} ${p.sign} size=${p.position}`)
+            .join("\n")
+        : "none",
+    )
     .replace("{{TRADE_HISTORY}}", tradeHistory)
-    .replace("{{MARKETS_INFO}}", MARKETS_INFO.trim());
+    .replace("{{STRATEGY_STATE}}", STRATEGY_STATE);
 
   console.log(`[${account.name}] equity=$${equity.toFixed(2)} avail=$${availableCash.toFixed(2)} positions=${openPositions?.length ?? 0}`);
   console.log("Calling AI model:", account.modelName);
@@ -654,12 +863,75 @@ export const invokeAgent = async (account: Account) => {
         },
       },
     },
+    {
+      type: "function",
+      function: {
+        name: "notifyTelegram",
+        description: "Send a concise alert to Telegram (PnL, halts, questions). Use sparingly.",
+        parameters: {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "Short title" },
+            message: { type: "string", description: "Main message content" },
+          },
+          required: ["title", "message"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "notifyTelegram",
+        description: "Send a concise alert to Telegram (PnL, halts, questions). Use sparingly.",
+        parameters: {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "Short title" },
+            message: { type: "string", description: "Main message content" },
+          },
+          required: ["title", "message"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "setStrategy",
+        description: "Change the active regime. Use this when market conditions shift and your posture must shift with them (e.g. rising drawdown → defensive; strong breadth + trend → aggressive; uncertain regime → cash). The regime persists across cycles until you change it again. ALWAYS include a one-sentence reason in note.",
+        parameters: {
+          type: "object",
+          properties: {
+            mode: {
+              type: "string",
+              enum: STRATEGY_MODES,
+              description: "aggressive | balanced | defensive | cash",
+            },
+            bias: {
+              type: "string",
+              enum: STRATEGY_BIASES,
+              description: "Directional tilt for new entries",
+            },
+            riskTier: {
+              type: "string",
+              enum: STRATEGY_TIERS,
+              description: "low scales caps 0.5x, normal = 1x, high = unchanged (still hard-capped by policy)",
+            },
+            note: {
+              type: "string",
+              description: "Short sentence explaining why the regime is changing. Required.",
+            },
+          },
+          required: ["mode", "bias", "riskTier", "note"],
+        },
+      },
+    },
   ];
 
   mark("prompt-built");
-  const choice = await callDOChat(account.modelName, [{ role: "user", content: enrichedPrompt }], tools);
+  const choice = await callLLMChat(account.modelName, [{ role: "user", content: enrichedPrompt }], tools);
   mark("llm-call");
   let responseText = choice.message.content ?? "";
+  const llmDuration = choice.durationMs ?? 0;
 
   const seenInCycle = new Set<string>();
 
@@ -686,8 +958,10 @@ export const invokeAgent = async (account: Account) => {
           const side = args.side!;
           const indicators = indicatorBySymbol.get(symbol);
           const lastPrice = indicators?.lastPrice ?? (await getLatestPrice(MARKETS[symbol as keyof typeof MARKETS].marketId));
-          const lastAtr = indicators?.atr14[indicators.atr14.length - 1] ?? 0;
-          const leverage = MARKET_LEVERAGE[symbol] ?? 5;
+      const lastAtr = indicators?.atr14[indicators.atr14.length - 1] ?? 0;
+      const lastAdx = indicators?.adx14[indicators.adx14.length - 1] ?? 0;
+      const lastRsi = indicators?.rsi[indicators.rsi.length - 1] ?? 50;
+      const leverage = MARKET_LEVERAGE[symbol] ?? 5;
 
           const decision = riskCheck({
             symbol,
@@ -696,10 +970,13 @@ export const invokeAgent = async (account: Account) => {
             leverage,
             lastPrice,
             atr: lastAtr,
+            adx: lastAdx,
+            rsi: lastRsi,
             equity,
             availableCash,
             openPositions: openPositions ?? [],
             seenInCycle,
+            minRR: MIN_RR,
           });
 
           if (!decision.approved) {
@@ -715,7 +992,7 @@ export const invokeAgent = async (account: Account) => {
           }
 
           if (DRY_RUN || !ENABLE_TRADING) {
-            responseText += ` [DRY_RUN MARKET ${side} ${symbol} $${decision.approvedAmount} @${leverage}x SL=${decision.stopPrice}]`;
+            responseText += ` [DRY_RUN MARKET ${side} ${symbol} $${decision.approvedAmount} @${leverage}x SL=${decision.stopPrice}${decision.minTakeProfit ? ", min-TP @ " + decision.minTakeProfit.toFixed(4) : ""}]`;
             await prisma.toolCalls.create({
               data: {
                 invocationId: modelInvocation.id,
@@ -729,6 +1006,7 @@ export const invokeAgent = async (account: Account) => {
                   stopPrice: decision.stopPrice,
                   type: "market",
                   dryRun: true,
+                  minTakeProfit: decision.minTakeProfit,
                 }),
               },
             });
@@ -759,25 +1037,52 @@ export const invokeAgent = async (account: Account) => {
             } catch (closeErr) {
               responseText += ` [CRITICAL ${symbol}: SL AND close failed — ${(closeErr as Error).message}]`;
             }
+            try {
+              await prisma.riskHaltEvent.create({
+                data: {
+                  modelId: account.id,
+                  type: HaltType.MANUAL,
+                  clearsAt: new Date(Date.now() + RISK.SL_FAILURE_HALT_HOURS * 60 * 60 * 1000),
+                  payload: JSON.stringify({ symbol, reason: slResult.error ?? "auto SL failed" }),
+                },
+              });
+              responseText += ` [HALT ${RISK.SL_FAILURE_HALT_HOURS}h: auto-SL failed]`;
+            } catch (haltErr) {
+              console.error("Failed to record halt after SL failure:", (haltErr as Error).message);
+            }
           } else {
-            responseText += ` [MARKET ${side} ${symbol} $${decision.approvedAmount}${decision.capped ? " (CAPPED)" : ""} @${leverage}x, auto-SL @ ${decision.stopPrice.toFixed(4)}]`;
+            responseText += ` [MARKET ${side} ${symbol} $${decision.approvedAmount}${decision.capped ? " (CAPPED)" : ""} @${leverage}x, auto-SL @ ${decision.stopPrice.toFixed(4)}${decision.minTakeProfit ? ", min-TP @ " + decision.minTakeProfit.toFixed(4) : ""}]`;
           }
-          await prisma.toolCalls.create({
-            data: {
-              invocationId: modelInvocation.id,
-              toolCallType: ToolCallType.CREATE_POSITION,
-              metadata: JSON.stringify({
-                symbol, side,
-                quantity: decision.approvedQuantity,
-                amount: decision.approvedAmount,
-                requested: args.amount,
-                capped: decision.capped,
-                stopPrice: decision.stopPrice,
-                autoSlOk: slResult.ok,
-                type: "market",
-              }),
-            },
-          });
+      await prisma.toolCalls.create({
+        data: {
+          invocationId: modelInvocation.id,
+          toolCallType: ToolCallType.CREATE_POSITION,
+          metadata: JSON.stringify({
+            symbol, side,
+            quantity: decision.approvedQuantity,
+            amount: decision.approvedAmount,
+            requested: args.amount,
+            capped: decision.capped,
+            stopPrice: decision.stopPrice,
+            autoSlOk: slResult.ok,
+            type: "market",
+            minTakeProfit: decision.minTakeProfit,
+          }),
+        },
+      });
+          if (!DRY_RUN && slResult.ok && decision.minTakeProfit) {
+            const last = lastTelegramAt[account.id] ?? 0;
+            if (Date.now() - last > TELEGRAM_NOTIFY_COOLDOWN_MS) {
+              lastTelegramAt[account.id] = Date.now();
+              void sendTelegramAlert(
+                `New position opened (${account.name})`,
+                [
+                  `${side} ${symbol} amount=$${decision.approvedAmount.toFixed(2)}${decision.capped ? " (capped)" : ""}`,
+                  `auto SL @ ${decision.stopPrice.toFixed(4)} | min TP @ ${decision.minTakeProfit.toFixed(4)}`,
+                ],
+              );
+            }
+          }
           if (slResult.ok) {
             await prisma.toolCalls.create({
               data: {
@@ -795,6 +1100,8 @@ export const invokeAgent = async (account: Account) => {
           const market = MARKETS[symbol as keyof typeof MARKETS];
           const indicators = indicatorBySymbol.get(symbol);
           const lastAtr = indicators?.atr14[indicators.atr14.length - 1] ?? 0;
+          const lastAdx = indicators?.adx14[indicators.adx14.length - 1] ?? 0;
+          const lastRsi = indicators?.rsi[indicators.rsi.length - 1] ?? 50;
           const leverage = MARKET_LEVERAGE[symbol] ?? 5;
 
           const decision = riskCheck({
@@ -804,10 +1111,13 @@ export const invokeAgent = async (account: Account) => {
             leverage,
             lastPrice: args.price!,
             atr: lastAtr,
+            adx: lastAdx,
+            rsi: lastRsi,
             equity,
             availableCash,
             openPositions: openPositions ?? [],
             seenInCycle,
+            minRR: MIN_RR,
           });
 
           if (!decision.approved) {
@@ -823,7 +1133,7 @@ export const invokeAgent = async (account: Account) => {
           }
 
           if (DRY_RUN || !ENABLE_TRADING) {
-            responseText += ` [DRY_RUN LIMIT ${side} ${symbol} $${decision.approvedAmount} @ $${args.price}]`;
+            responseText += ` [DRY_RUN LIMIT ${side} ${symbol} $${decision.approvedAmount} @ $${args.price}${decision.minTakeProfit ? ", min-TP @ " + decision.minTakeProfit.toFixed(4) : ""}]`;
             await prisma.toolCalls.create({
               data: {
                 invocationId: modelInvocation.id,
@@ -837,6 +1147,7 @@ export const invokeAgent = async (account: Account) => {
                   price: args.price,
                   type: "limit",
                   dryRun: true,
+                  minTakeProfit: decision.minTakeProfit,
                 }),
               },
             });
@@ -857,23 +1168,24 @@ export const invokeAgent = async (account: Account) => {
           ]);
           const parsed = JSON.parse(result) as { error?: string };
           if (parsed.error) throw new Error(parsed.error);
-          await prisma.toolCalls.create({
-            data: {
-              invocationId: modelInvocation.id,
-              toolCallType: ToolCallType.CREATE_POSITION,
-              metadata: JSON.stringify({
-                symbol, side,
-                quantity: decision.approvedQuantity,
-                amount: decision.approvedAmount,
-                requested: args.amount,
-                capped: decision.capped,
-                price: args.price,
-                type: "limit",
-              }),
-            },
-          });
-          responseText += ` [LIMIT ${side} ${symbol} $${decision.approvedAmount}${decision.capped ? " (CAPPED)" : ""} @ $${args.price}]`;
-          seenInCycle.add(symbol);
+           await prisma.toolCalls.create({
+             data: {
+               invocationId: modelInvocation.id,
+               toolCallType: ToolCallType.CREATE_POSITION,
+               metadata: JSON.stringify({
+                 symbol, side,
+                 quantity: decision.approvedQuantity,
+                 amount: decision.approvedAmount,
+                 requested: args.amount,
+                 capped: decision.capped,
+                 price: args.price,
+                 type: "limit",
+                 minTakeProfit: decision.minTakeProfit,
+               }),
+             },
+           });
+           responseText += ` [LIMIT ${side} ${symbol} $${decision.approvedAmount}${decision.capped ? " (CAPPED)" : ""} @ $${args.price}${decision.minTakeProfit ? ", min-TP @ " + decision.minTakeProfit.toFixed(4) : ""}]`;
+           seenInCycle.add(symbol);
 
         } else if (fn === "closePosition") {
           const symbol = args.symbol!;
@@ -986,6 +1298,63 @@ export const invokeAgent = async (account: Account) => {
             },
           });
           responseText += ` [${action.toUpperCase()} ${symbol} @ $${args.triggerPrice}]`;
+
+        } else if (fn === "notifyTelegram") {
+          const [title, message] = (args.note ?? "|").split("|", 2);
+          const last = lastTelegramAt[account.id] ?? 0;
+          if (Date.now() - last < TELEGRAM_NOTIFY_COOLDOWN_MS) {
+            responseText += " [REJECTED notifyTelegram: cooldown]";
+            await prisma.toolCalls.create({
+              data: {
+                invocationId: modelInvocation.id,
+                toolCallType: ToolCallType.REJECTED,
+                metadata: JSON.stringify({ type: "notifyTelegram", reason: "cooldown" }),
+              },
+            });
+            continue;
+          }
+          lastTelegramAt[account.id] = Date.now();
+          void sendTelegramAlert(title || "Alert", [message || "(empty)"]);
+          responseText += " [NOTIFIED TELEGRAM]";
+          await prisma.toolCalls.create({
+            data: {
+              invocationId: modelInvocation.id,
+              toolCallType: ToolCallType.NOTIFY,
+              metadata: JSON.stringify({ title, message }),
+            },
+          });
+
+        } else if (fn === "setStrategy") {
+          const stratValidation = validateStrategyArgs(tc.function.arguments);
+          if (!stratValidation.ok) {
+            responseText += ` [REJECTED setStrategy: ${stratValidation.reason}]`;
+            await prisma.toolCalls.create({
+              data: {
+                invocationId: modelInvocation.id,
+                toolCallType: ToolCallType.REJECTED,
+                metadata: JSON.stringify({ type: "setStrategy", reason: stratValidation.reason }),
+              },
+            });
+            continue;
+          }
+          const next: StrategyState = {
+            mode: stratValidation.args.mode!,
+            bias: stratValidation.args.bias!,
+            riskTier: stratValidation.args.riskTier!,
+            note: stratValidation.args.note!,
+          };
+          await prisma.models.update({
+            where: { id: account.id },
+            data: { strategyState: JSON.stringify(next) },
+          });
+          await prisma.toolCalls.create({
+            data: {
+              invocationId: modelInvocation.id,
+              toolCallType: ToolCallType.SET_STRATEGY,
+              metadata: JSON.stringify(next),
+            },
+          });
+          responseText += ` [STRATEGY mode=${next.mode} bias=${next.bias} riskTier=${next.riskTier} note="${next.note}"]`;
         }
       } catch (err) {
         responseText += ` [ERROR ${fn}: ${(err as Error).message}]`;
@@ -1003,7 +1372,10 @@ export const invokeAgent = async (account: Account) => {
   });
   await prisma.invocations.update({
     where: { id: modelInvocation.id },
-    data: { response: responseText.trim() },
+    data: {
+      response: responseText.trim(),
+      llmDurationMs: llmDuration,
+    },
   });
   mark("total");
   return responseText;

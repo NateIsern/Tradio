@@ -21,6 +21,7 @@ type ChatMsg = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  thinking?: string;
   streaming?: boolean;
 };
 
@@ -56,23 +57,35 @@ export default function AiChat({ backendUrl }: Props) {
       abortRef.current = controller;
 
       let assistantInserted = false;
+      const ensureAssistant = () => {
+        if (assistantInserted) return;
+        assistantInserted = true;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: assistantId,
+            role: "assistant",
+            content: "",
+            thinking: "",
+            streaming: true,
+          },
+        ]);
+      };
       const appendToken = (token: string) => {
-        if (!assistantInserted) {
-          assistantInserted = true;
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: assistantId,
-              role: "assistant",
-              content: token,
-              streaming: true,
-            },
-          ]);
-          return;
-        }
+        ensureAssistant();
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId ? { ...m, content: m.content + token } : m
+          )
+        );
+      };
+      const appendThinking = (token: string) => {
+        ensureAssistant();
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? { ...m, thinking: (m.thinking ?? "") + token }
+              : m
           )
         );
       };
@@ -132,6 +145,13 @@ export default function AiChat({ backendUrl }: Props) {
                 if (parsed.content) appendToken(parsed.content);
               } catch {
                 // ignore malformed token chunk
+              }
+            } else if (eventName === "thinking") {
+              try {
+                const parsed = JSON.parse(payload) as { content?: string };
+                if (parsed.content) appendThinking(parsed.content);
+              } catch {
+                // ignore malformed thinking chunk
               }
             } else if (eventName === "error") {
               try {
@@ -278,16 +298,31 @@ export default function AiChat({ backendUrl }: Props) {
                         </span>
                       </div>
                     )}
-                    <MessageContent
-                      markdown={msg.role === "assistant"}
-                      className={
-                        msg.role === "user"
-                          ? "ai-markdown max-w-[85%] rounded-2xl bg-terminal-green/10 px-3 py-2 text-[11px] text-terminal-text"
-                          : "ai-markdown max-w-[85%] rounded-2xl bg-transparent px-0 py-0 text-[11px] text-terminal-text"
-                      }
-                    >
-                      {msg.content}
-                    </MessageContent>
+                    <div className="flex max-w-[85%] flex-col gap-1">
+                      {msg.role === "assistant" && msg.thinking && (
+                        <details
+                          className="rounded border border-terminal-border/60 bg-terminal-panel/40 px-2 py-1 text-[10px] text-terminal-muted"
+                          open={msg.streaming}
+                        >
+                          <summary className="cursor-pointer select-none text-terminal-muted/80 hover:text-terminal-green">
+                            {msg.streaming ? "thinking..." : "thinking"}
+                          </summary>
+                          <pre className="mt-1 whitespace-pre-wrap font-mono text-[10px] leading-snug text-terminal-muted/90">
+                            {msg.thinking}
+                          </pre>
+                        </details>
+                      )}
+                      <MessageContent
+                        markdown={msg.role === "assistant"}
+                        className={
+                          msg.role === "user"
+                            ? "ai-markdown rounded-2xl bg-terminal-green/10 px-3 py-2 text-[11px] text-terminal-text"
+                            : "ai-markdown rounded-2xl bg-transparent px-0 py-0 text-[11px] text-terminal-text"
+                        }
+                      >
+                        {msg.content}
+                      </MessageContent>
+                    </div>
                     {msg.streaming && (
                       <span className="mt-1.5 ml-0.5 inline-block h-3 w-[2px] animate-pulse bg-terminal-green" />
                     )}

@@ -8,6 +8,7 @@ interface Position {
     unrealizedPnl: string;
     realizedPnl: string;
     liquidationPrice: string;
+    avg_entry_price?: string;
 }
 
 export async function getOpenPositions(apiKey: string, accountIndex: string) {
@@ -22,5 +23,6 @@ export async function getOpenPositions(apiKey: string, accountIndex: string) {
         unrealizedPnl: p.unrealizedPnl,
         realizedPnl: p.realizedPnl,
         liquidationPrice: p.liquidationPrice,
+        entryPrice: p.avg_entry_price ?? undefined,
     }));
 }

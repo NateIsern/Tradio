@@ -23,12 +23,31 @@ model Models {
   invocations          Invocations[]
   portfolioSize        PortfolioSize[]
   accountIndex         String
+  // Regime state. The LLM flips this via setStrategy when conditions change.
+  // JSON blob so we can add fields without migrations (mode, bias, riskTier, note).
+  strategyState        String   @default("{\"mode\":\"balanced\",\"bias\":\"neutral\",\"riskTier\":\"normal\",\"note\":\"initial\"}")
+}
+
+enum ToolCallType {
+  CREATE_POSITION
+  CLOSE_POSITION
+  SET_SL
+  SET_TP
+  SET_STRATEGY
+  HALT
+  REJECTED
+  NOTIFY
 }
 
 model Invocations {
   id                   String   @id @default(auto()) @map("_id") @db.ObjectId
   modelId              String   @db.ObjectId
   response             String
+  equity               String?  // equity at start of cycle
+  availableCash        String?  // available cash at start
+  openPositions        String?  // serialized open positions snapshot
+  indicatorsSummary    String?  // serialized subset of indicators used in prompt
+  llmDurationMs        Int?     // latency of LLM call
   model                Models   @relation(fields: [modelId], references: [id])
   toolCalls            ToolCalls[]
   createdAt            DateTime @default(now())
@@ -72,15 +91,6 @@ model RiskHaltEvent {
   createdAt    DateTime @default(now())
 
   @@index([modelId, clearsAt])
-}
-
-enum ToolCallType {
-  CREATE_POSITION
-  CLOSE_POSITION
-  SET_SL
-  SET_TP
-  HALT
-  REJECTED
 }
 
 enum HaltType {

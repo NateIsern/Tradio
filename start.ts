@@ -8,10 +8,14 @@ const procs: { name: string; proc: ChildProcess }[] = [];
 
 function run(name: string, cmd: string, args: string[], cwd = ROOT, restart = false) {
   function launch() {
+    // `detached: true` gives each child its own process group. On shutdown
+    // we signal the whole group so any bun sub-processes or hot-reload
+    // workers die with the parent — no orphans left holding port 3001.
     const proc = spawn(cmd, args, {
       cwd,
       env: process.env,
       stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
     });
 
     proc.stdout?.on("data", (d: Buffer) => {
@@ -48,19 +52,35 @@ function run(name: string, cmd: string, args: string[], cwd = ROOT, restart = fa
 
 console.log("Starting Tradio...\n");
 
-run("bot", "bun", ["run", "index.ts"]);
-run("api", "bun", ["run", "backend.ts"], ROOT, true);
+// Bot: Bun's --hot reloads the module graph in-place on save.
+// API: Bun's --watch restarts the whole process (reliable port rebind for
+//      Express; --hot leaks listeners and causes EADDRINUSE on reload).
+// Dashboard: Vite HMR handles frontend hot reload on its own.
+run("bot", "bun", ["--hot", "run", "index.ts"]);
+run("api", "bun", ["--watch", "run", "backend.ts"], ROOT, true);
 run("dashboard", "bun", ["run", "dev"], FRONTEND);
 
-console.log("  Bot:       running (every 2 min)");
-console.log("  API:       http://localhost:3000");
-console.log("  Dashboard: http://localhost:5173\n");
+console.log("  Bot:       running (hot reload)");
+console.log("  API:       http://localhost:3001 (watch restart)");
+console.log("  Dashboard: http://localhost:5173 (vite HMR)\n");
 
-process.on("SIGINT", () => {
+let shuttingDown = false;
+function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   console.log("\nShutting down...");
   for (const { name, proc } of procs) {
-    proc.kill();
+    try {
+      // Negative pid = process group. Kills the bun child AND any
+      // sub-processes it forked (hot-reload workers, etc).
+      if (proc.pid) process.kill(-proc.pid, "SIGTERM");
+    } catch {
+      // process already dead
+    }
     console.log(`  [${name}] stopped`);
   }
-  process.exit(0);
-});
+  setTimeout(() => process.exit(0), 500);
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

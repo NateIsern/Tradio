@@ -4,8 +4,8 @@ const prisma = new PrismaClient();
 
 const models = [
   {
-    name: 'claude-trader',
-    openRoutermodelName: 'anthropic-claude-opus-4.6',
+    name: 'qwen-trader',
+    openRoutermodelName: 'qwen3.5:latest',
     lighterApiKey: process.env['LIGHTER_API_KEY'] ?? '',
     accountIndex: process.env['ACCOUNT_INDEX'] ?? '722509',
   },
