@@ -38,3 +38,8 @@ generated/
 lighter-sdk-ts/signers/*.so
 lighter-sdk-ts/signers/*.dylib
 lighter-sdk-ts/signers/*.dll
+
+# Python
+__pycache__/
+*.pyc
+.venv/
