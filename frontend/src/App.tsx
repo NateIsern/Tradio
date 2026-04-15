@@ -7,8 +7,12 @@ import Navbar from "./components/Navbar";
 import StatusBar from "./components/StatusBar";
 import SearchBar from "./components/SearchBar";
 
-const BACKEND_URL = "http://localhost:3000";
-const POLL_INTERVAL = 30_000;
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL ?? "http://localhost:3001";
+// Slow-changing stuff (P&L history, invocation list, stats) still polls at a
+// leisurely cadence. Positions + prices now come over SSE /stream, so the
+// watchlist and positions panel update in near-realtime without spamming
+// Lighter.
+const SLOW_POLL_INTERVAL = 90_000;
 
 type PerformanceItem = {
   createdAt: string;
@@ -58,46 +62,69 @@ export default function App() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [prices, setPrices] = useState<Record<string, MarketPrice>>({});
 
-  const fetchAll = useCallback(async () => {
+  const fetchSlow = useCallback(async () => {
     try {
-      const [perfRes, invocRes, posRes, statsRes, pricesRes] = await Promise.allSettled([
+      const [perfRes, invocRes, statsRes] = await Promise.allSettled([
         fetch(`${BACKEND_URL}/performance`),
         fetch(`${BACKEND_URL}/invocations?limit=30`),
-        fetch(`${BACKEND_URL}/positions`),
         fetch(`${BACKEND_URL}/stats`),
-        fetch(`${BACKEND_URL}/market-prices`),
       ]);
 
       if (perfRes.status === "fulfilled" && perfRes.value.ok) {
-        const d = await perfRes.value.json();
+        const d = (await perfRes.value.json()) as {
+          data: PerformanceItem[];
+          lastUpdated?: string;
+        };
         setPerformanceData(d.data);
         setLastUpdated(d.lastUpdated ? new Date(d.lastUpdated) : new Date());
       }
       if (invocRes.status === "fulfilled" && invocRes.value.ok) {
-        const d = await invocRes.value.json();
+        const d = (await invocRes.value.json()) as { data: Invocation[] };
         setInvocationsData(d.data);
       }
-      if (posRes.status === "fulfilled" && posRes.value.ok) {
-        const d = await posRes.value.json();
-        setPositions(d.data ?? []);
-      }
       if (statsRes.status === "fulfilled" && statsRes.value.ok) {
-        setStats(await statsRes.value.json());
-      }
-      if (pricesRes.status === "fulfilled" && pricesRes.value.ok) {
-        const d = await pricesRes.value.json();
-        setPrices(d.prices ?? {});
+        setStats((await statsRes.value.json()) as Stats);
       }
     } catch (err) {
-      console.error("Error fetching data:", err);
+      console.error("Error fetching slow data:", err);
     }
   }, []);
 
   useEffect(() => {
-    fetchAll();
-    const interval = setInterval(fetchAll, POLL_INTERVAL);
+    fetchSlow();
+    const interval = setInterval(fetchSlow, SLOW_POLL_INTERVAL);
     return () => clearInterval(interval);
-  }, [fetchAll]);
+  }, [fetchSlow]);
+
+  // Realtime stream for positions + market prices. A single EventSource
+  // replaces the old 30s poll and pushes a snapshot whenever the backend
+  // cache changes (~every 3s). If the connection drops, the browser's
+  // native retry kicks in automatically.
+  useEffect(() => {
+    const source = new EventSource(`${BACKEND_URL}/stream`);
+    const handler = (event: MessageEvent<string>) => {
+      try {
+        const snapshot = JSON.parse(event.data) as {
+          positions?: Position[];
+          marketPrices?: Record<string, MarketPrice>;
+        };
+        if (Array.isArray(snapshot.positions)) {
+          setPositions(snapshot.positions);
+        }
+        if (snapshot.marketPrices) {
+          setPrices(snapshot.marketPrices);
+        }
+        setLastUpdated(new Date());
+      } catch (err) {
+        console.error("stream parse error:", err);
+      }
+    };
+    source.addEventListener("snapshot", handler);
+    return () => {
+      source.removeEventListener("snapshot", handler);
+      source.close();
+    };
+  }, []);
 
   const loading = !performanceData || !invocationsData;
 

@@ -1,6 +1,6 @@
 import { execSync } from "child_process";
 import type { Account } from "./accounts";
-import { BASE_URL } from "./config";
+import { BASE_URL, PYTHON } from "./config";
 import { MARKETS } from "./markets";
 import { getOpenPositions } from "./openPositions";
 import { getAuthToken, fetchH2 } from "./auth";
@@ -39,7 +39,7 @@ export async function cancelAllOrders(account: Account) {
     if (positionsData.length === 0) return;
 
     const result = execSync(
-        `python3 trade.py close_all '${JSON.stringify(positionsData)}' `,
+        `"${PYTHON}" trade.py close_all '${JSON.stringify(positionsData)}' `,
         { cwd: import.meta.dir, env: process.env },
     ).toString().trim();
 

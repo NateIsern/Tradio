@@ -2,9 +2,17 @@ import express from "express";
 import { PrismaClient, type PortfolioSize } from "./generated/prisma/client";
 import cors from "cors";
 import { getAuthToken, fetchH2 } from "./auth";
-import { BASE_URL } from "./config";
+import { BASE_URL, LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_OVERRIDE } from "./config";
 import { MARKETS } from "./markets";
 import { getIndicators } from "./stockData";
+import {
+  fetchTelegramUpdates,
+  sendTelegramAlert,
+  sendTelegramMessage,
+  editTelegramMessage,
+  sendTelegramTyping,
+} from "./telegram";
+import { TELEGRAM_ALERTS_ENABLED } from "./config";
 
 const prisma = new PrismaClient();
 
@@ -16,6 +24,7 @@ let lastUpdatedGlobal: Date | null = null;
 let invocationsCacheGlobal: any[] = [];
 let invocationsLastUpdatedGlobal: Date | null = null;
 let invocationsRefreshInFlight = false;
+const API_CACHE_TTL_MS = 90_000;
 
 async function refreshInvocations(take: number) {
   if (invocationsRefreshInFlight) return;
@@ -43,7 +52,7 @@ async function refreshInvocations(take: number) {
 }
 
 app.get("/performance", async (req, res) => {
-  if (lastUpdatedGlobal && lastUpdatedGlobal.getTime() + 1000 * 60 * 5 > Date.now()) {
+  if (lastUpdatedGlobal && lastUpdatedGlobal.getTime() + API_CACHE_TTL_MS > Date.now()) {
     res.json({data: timeseriesDataGlobal, lastUpdated: lastUpdatedGlobal});
     return;
   }
@@ -66,7 +75,7 @@ app.get("/invocations", async (req, res) => {
   const limitParam = Number(req.query.limit);
   const take = Number.isFinite(limitParam) && limitParam > 0 && limitParam <= 200 ? limitParam : 30;
   const now = Date.now();
-  const isFresh = invocationsLastUpdatedGlobal && invocationsLastUpdatedGlobal.getTime() + 1000 * 60 * 2 > now;
+  const isFresh = invocationsLastUpdatedGlobal && invocationsLastUpdatedGlobal.getTime() + API_CACHE_TTL_MS > now;
 
   if (!invocationsCacheGlobal.length) {
     await refreshInvocations(take);
@@ -81,51 +90,88 @@ app.get("/invocations", async (req, res) => {
   }
 });
 
-app.get("/positions", async (_req, res) => {
-  try {
-    const token = getAuthToken();
-    const accountIndex = process.env.ACCOUNT_INDEX ?? "0";
-    const url = `${BASE_URL}/api/v1/account?by=index&value=${accountIndex}`;
-    const raw = await fetchH2(url, token);
-    const account = JSON.parse(raw);
-    const positions: Array<{
-      symbol: string;
-      side: "LONG" | "SHORT";
-      size: number;
-      entryPrice: number;
-      markPrice: number;
-      unrealizedPnl: number;
-      liquidationPrice: number;
-    }> = [];
+type PositionRow = {
+  symbol: string;
+  side: "LONG" | "SHORT";
+  size: number;
+  entryPrice: number;
+  markPrice: number;
+  unrealizedPnl: number;
+  liquidationPrice: number;
+};
 
-    const acct = account.accounts?.[0];
-    const markPrices = await fetchLiveMarkPrices();
+let positionsCache: PositionRow[] = [];
+let positionsLastUpdated: Date | null = null;
+let positionsRefreshInFlight: Promise<void> | null = null;
+const POSITIONS_TTL_MS = 25_000; // reduce fetch cadence to ease 429s
 
-    if (acct?.positions && Array.isArray(acct.positions)) {
-      for (const pos of acct.positions) {
-        const size = Number(pos.position ?? pos.size ?? 0);
-        if (size === 0) continue;
-        const side =
-          pos.sign === 1 || pos.sign === "1"
-            ? ("LONG" as const)
-            : ("SHORT" as const);
-        const symbol = pos.symbol ?? "?";
-        positions.push({
-          symbol,
-          side,
-          size: Math.abs(size),
-          entryPrice: Number(pos.avg_entry_price ?? 0),
-          markPrice: markPrices[symbol] ?? 0,
-          unrealizedPnl: Number(pos.unrealized_pnl ?? 0),
-          liquidationPrice: Number(pos.liquidation_price ?? 0),
-        });
+async function refreshPositions(): Promise<void> {
+  if (positionsRefreshInFlight) return positionsRefreshInFlight;
+  positionsRefreshInFlight = (async () => {
+    try {
+      const token = getAuthToken();
+      const accountIndex = process.env.ACCOUNT_INDEX ?? "0";
+      const url = `${BASE_URL}/api/v1/account?by=index&value=${accountIndex}`;
+      const raw = await fetchH2(url, token);
+      const account = JSON.parse(raw);
+      const rows: PositionRow[] = [];
+      const acct = account.accounts?.[0];
+      const markPrices = await fetchLiveMarkPrices();
+      if (acct?.positions && Array.isArray(acct.positions)) {
+        for (const pos of acct.positions) {
+          const size = Number(pos.position ?? pos.size ?? 0);
+          if (size === 0) continue;
+          const side =
+            pos.sign === 1 || pos.sign === "1"
+              ? ("LONG" as const)
+              : ("SHORT" as const);
+          const symbol = pos.symbol ?? "?";
+          rows.push({
+            symbol,
+            side,
+            size: Math.abs(size),
+            entryPrice: Number(pos.avg_entry_price ?? 0),
+            markPrice: markPrices[symbol] ?? 0,
+            unrealizedPnl: Number(pos.unrealized_pnl ?? 0),
+            liquidationPrice: Number(pos.liquidation_price ?? 0),
+          });
+        }
       }
+      positionsCache = rows;
+      positionsLastUpdated = new Date();
+    } finally {
+      positionsRefreshInFlight = null;
     }
+  })();
+  return positionsRefreshInFlight;
+}
 
-    res.json({ data: positions });
-  } catch (err) {
-    console.error("Error fetching positions:", err);
-    res.status(500).json({ error: "Failed to fetch positions" });
+app.get("/positions", async (_req, res) => {
+  const now = Date.now();
+  const isFresh =
+    positionsLastUpdated && positionsLastUpdated.getTime() + POSITIONS_TTL_MS > now;
+
+  if (positionsCache.length === 0 && !positionsLastUpdated) {
+    try {
+      await refreshPositions();
+      res.json({ data: positionsCache, lastUpdated: positionsLastUpdated });
+    } catch (err) {
+      console.error("Error fetching positions:", err);
+      res.status(500).json({ error: "Failed to fetch positions" });
+    }
+    return;
+  }
+
+  res.json({
+    data: positionsCache,
+    lastUpdated: positionsLastUpdated,
+    stale: !isFresh,
+  });
+
+  if (!isFresh && !positionsRefreshInFlight) {
+    refreshPositions().catch((err) =>
+      console.error("Error refreshing positions:", err),
+    );
   }
 });
 
@@ -318,7 +364,7 @@ async function refreshMarketPrices() {
 
 app.get("/market-prices", async (_req, res) => {
   const now = Date.now();
-  const isFresh = marketPricesLastUpdated && marketPricesLastUpdated.getTime() + 1000 * 60 * 2 > now;
+  const isFresh = marketPricesLastUpdated && marketPricesLastUpdated.getTime() + API_CACHE_TTL_MS > now;
 
   if (Object.keys(marketPricesCache).length === 0) {
     await refreshMarketPrices();
@@ -343,25 +389,44 @@ const CHAT_SYSTEM_PROMPT = [
   "Be concise, direct, and numbers-driven. Use Markdown for structure.",
 ].join("\n");
 
-async function streamDOChat(
-  model: string,
+
+// Native Ollama /api/chat. Using the native endpoint instead of the OpenAI
+// shim because the shim drops the `think` flag, the `thinking` stream field,
+// and delivers reasoning as a hidden `reasoning` blob we cannot surface to
+// the UI. Here we emit thinking tokens and final content as separate channels
+// so the dashboard can show the model's reasoning live.
+type ChatStreamHandlers = {
+  onThinking?: (token: string) => void;
+  onToken: (token: string) => void;
+};
+
+async function streamLLMChat(
+  _model: string,
   messages: ChatMessage[],
   signal: AbortSignal,
-  onToken: (token: string) => void,
+  handlers: ChatStreamHandlers,
 ): Promise<void> {
-  const response = await fetch("https://inference.do-ai.run/v1/chat/completions", {
+  const ollamaBase = LLM_BASE_URL.replace(/\/v1\/?$/, "");
+  const response = await fetch(`${ollamaBase}/api/chat`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env["DO_MODEL_ACCESS_KEY"]}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ model, messages, max_completion_tokens: 2048, stream: true }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: LLM_MODEL_OVERRIDE,
+      messages,
+      stream: true,
+      think: true,
+      keep_alive: "30m",
+      options: {
+        temperature: 0.3,
+        num_predict: 4096,
+      },
+    }),
     signal,
   });
 
   if (!response.ok || !response.body) {
     const text = await response.text().catch(() => "");
-    throw new Error(`DO API error (${response.status}): ${text.slice(0, 500)}`);
+    throw new Error(`LLM API error (${response.status}): ${text.slice(0, 500)}`);
   }
 
   const reader = response.body.getReader();
@@ -377,17 +442,19 @@ async function streamDOChat(
     while ((nlIdx = buffer.indexOf("\n")) !== -1) {
       const line = buffer.slice(0, nlIdx).trim();
       buffer = buffer.slice(nlIdx + 1);
-      if (!line.startsWith("data:")) continue;
-      const payload = line.slice(5).trim();
-      if (payload === "[DONE]") return;
+      if (!line) continue;
       try {
-        const json = JSON.parse(payload) as {
-          choices?: Array<{ delta?: { content?: string } }>;
-          error?: { message: string };
+        const json = JSON.parse(line) as {
+          message?: { content?: string; thinking?: string };
+          error?: string;
+          done?: boolean;
         };
-        if (json.error) throw new Error(json.error.message);
-        const token = json.choices?.[0]?.delta?.content;
-        if (token) onToken(token);
+        if (json.error) throw new Error(json.error);
+        const thinking = json.message?.thinking;
+        if (thinking && handlers.onThinking) handlers.onThinking(thinking);
+        const token = json.message?.content;
+        if (token) handlers.onToken(token);
+        if (json.done) return;
       } catch (err) {
         if ((err as Error).message?.startsWith("Unexpected")) continue;
         throw err;
@@ -779,8 +846,9 @@ app.post("/chat", async (req, res) => {
 
     send("start", { model: model.name });
 
-    await streamDOChat(model.openRoutermodelName, messages, abort.signal, (token) => {
-      send("token", { content: token });
+    await streamLLMChat(model.openRoutermodelName, messages, abort.signal, {
+      onThinking: (token) => send("thinking", { content: token }),
+      onToken: (token) => send("token", { content: token }),
     });
 
     send("done", {});
@@ -796,6 +864,357 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-app.listen(3000, () => {
-  console.log("Server is running on port 3000");
+// --- Live stream (Server-Sent Events) -------------------------------------
+//
+// Dashboard gets realtime-ish updates by keeping one long-lived HTTP
+// connection open and pushing snapshots every time the shared caches are
+// refreshed. No polling from the client side, no extra load on Lighter —
+// snapshots are sourced from the same caches /positions and /market-prices
+// already serve, so the backend fans out to every connected client for free.
+const streamClients = new Set<express.Response>();
+
+// --- Telegram inbound polling (simple long-poll loop) -----------------------
+let telegramOffset = 0;
+let telegramPollLock = false;
+
+// Per-chat rolling conversation buffer. Keeps the last few turns in memory
+// so Nate can have a real thread with the agent without the backend needing
+// a DB write per message. Capped to avoid unbounded growth.
+const TELEGRAM_HISTORY_LIMIT = 8;
+const telegramHistory = new Map<string, ChatMessage[]>();
+
+function appendTelegramTurn(chatId: string, role: "user" | "assistant", content: string) {
+  const list = telegramHistory.get(chatId) ?? [];
+  list.push({ role, content });
+  while (list.length > TELEGRAM_HISTORY_LIMIT) list.shift();
+  telegramHistory.set(chatId, list);
+}
+
+// Telegram sendMessage has a 4096 char ceiling. Keep replies well under it
+// so Markdown parsing never truncates mid-token.
+function clipForTelegram(text: string, limit = 3800): string {
+  if (text.length <= limit) return text;
+  return text.slice(0, limit - 30) + "\n\n_…response truncated_";
+}
+
+// Stream an LLM reply straight into a Telegram message, editing in place so
+// Nate sees tokens appear live. Telegram rate-limits editMessageText to
+// roughly one edit per second per chat, so we debounce: accumulate tokens,
+// flush every ~900ms, always flush the final state. The typing indicator is
+// re-fired on the same cadence so the "Tradio is typing..." bubble stays up.
+async function streamLLMReplyToTelegram(
+  chatId: string,
+  messages: ChatMessage[],
+  initialMessageId: number,
+): Promise<string> {
+  const ollamaBase = LLM_BASE_URL.replace(/\/v1\/?$/, "");
+  const response = await fetch(`${ollamaBase}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: LLM_MODEL_OVERRIDE,
+      messages,
+      stream: true,
+      think: false,
+      keep_alive: "30m",
+      options: { temperature: 0.3, num_predict: 900 },
+    }),
+  });
+  if (!response.ok || !response.body) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`LLM API error (${response.status}): ${text.slice(0, 500)}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let acc = "";
+  let lastFlush = 0;
+  let lastFlushed = "";
+  let lastTyping = 0;
+  const FLUSH_INTERVAL_MS = 900;
+  const TYPING_INTERVAL_MS = 4000;
+
+  async function maybeFlush(force: boolean) {
+    const now = Date.now();
+    if (!force && now - lastFlush < FLUSH_INTERVAL_MS) return;
+    if (acc === lastFlushed) return;
+    lastFlush = now;
+    const visible = clipForTelegram(acc.length > 0 ? acc : "…", 3800);
+    lastFlushed = acc;
+    await editTelegramMessage(chatId, initialMessageId, visible, { parseMode: "none" });
+  }
+
+  function maybeTyping() {
+    const now = Date.now();
+    if (now - lastTyping < TYPING_INTERVAL_MS) return;
+    lastTyping = now;
+    void sendTelegramTyping(chatId);
+  }
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let nlIdx: number;
+    while ((nlIdx = buffer.indexOf("\n")) !== -1) {
+      const line = buffer.slice(0, nlIdx).trim();
+      buffer = buffer.slice(nlIdx + 1);
+      if (!line) continue;
+      try {
+        const json = JSON.parse(line) as {
+          message?: { content?: string };
+          error?: string;
+          done?: boolean;
+        };
+        if (json.error) throw new Error(json.error);
+        const token = json.message?.content;
+        if (token) acc += token;
+        if (token) {
+          maybeTyping();
+          await maybeFlush(false);
+        }
+        if (json.done) {
+          await maybeFlush(true);
+          return acc.trim();
+        }
+      } catch (err) {
+        if ((err as Error).message?.startsWith("Unexpected")) continue;
+        throw err;
+      }
+    }
+  }
+  await maybeFlush(true);
+  return acc.trim();
+}
+
+async function handleTelegramFreeText(chatId: string, text: string): Promise<void> {
+  console.log(`[telegram] handling free text from ${chatId}: ${text.slice(0, 60)}`);
+  const model = await prisma.models.findFirst();
+  if (!model) {
+    console.error("[telegram] no model configured");
+    void sendTelegramAlert("Error", ["No model configured."], chatId);
+    return;
+  }
+
+  // Live portfolio + positions + indicators so the reply is grounded in the
+  // current account state, not stale context. Degrades gracefully if Lighter
+  // is rate-limited — the LLM will just answer from its own knowledge.
+  let liveContext = "";
+  try {
+    liveContext = await buildLiveContext(model.id);
+  } catch (err) {
+    console.error("[telegram] buildLiveContext failed:", (err as Error).message);
+  }
+
+  const systemContent = liveContext
+    ? `${CHAT_SYSTEM_PROMPT}\n\nReply channel: Telegram. Keep answers short — 1-4 short paragraphs max. Plain text only, no Markdown syntax (asterisks, backticks, etc) because we stream edits that can break mid-token.\n\n## Live state\n${liveContext}`
+    : `${CHAT_SYSTEM_PROMPT}\n\nReply channel: Telegram. Keep answers short — 1-4 short paragraphs max. Plain text only.`;
+
+  appendTelegramTurn(chatId, "user", text);
+  const history = telegramHistory.get(chatId) ?? [];
+  const messages: ChatMessage[] = [
+    { role: "system", content: systemContent },
+    ...history,
+  ];
+
+  // Prime the streaming message and the typing indicator. If sendMessage
+  // fails we bail early — there is nowhere to stream into.
+  void sendTelegramTyping(chatId);
+  const primed = await sendTelegramMessage("…", chatId, { parseMode: "none" });
+  if (!primed.ok) {
+    console.error("[telegram] could not prime streaming message");
+    return;
+  }
+
+  try {
+    console.log(`[telegram] streaming LLM reply into msg ${primed.messageId}`);
+    const finalReply = await streamLLMReplyToTelegram(chatId, messages, primed.messageId);
+    const safeReply = finalReply.length > 0 ? finalReply : "(no response)";
+    appendTelegramTurn(chatId, "assistant", safeReply);
+    console.log(`[telegram] reply sent (${safeReply.length} chars)`);
+  } catch (err) {
+    const msg = (err as Error).message || "LLM call failed";
+    console.error("[telegram] LLM reply failed:", msg);
+    await editTelegramMessage(chatId, primed.messageId, `Error: ${msg.slice(0, 500)}`, {
+      parseMode: "none",
+    });
+  }
+}
+async function pollTelegram(): Promise<void> {
+  if (!TELEGRAM_ALERTS_ENABLED) return;
+  if (telegramPollLock) return;
+  telegramPollLock = true;
+  try {
+    const res = await fetchTelegramUpdates(telegramOffset + 1, 10);
+    if (!res.ok || !res.data) return;
+    const updates: any[] = Array.isArray(res.data.result) ? res.data.result : [];
+    if (updates.length > 0) {
+      console.log(`[telegram] ${updates.length} update(s) received`);
+    }
+    for (const u of updates) {
+      telegramOffset = Math.max(telegramOffset, u.update_id ?? telegramOffset);
+      const text = u.message?.text?.trim();
+      if (!text) continue;
+      const chatId = u.message?.chat?.id;
+      const from = u.message?.from?.username ?? "unknown";
+      console.log(`[telegram] msg from=@${from} chat=${chatId}: ${text.slice(0, 80)}`);
+
+      const chatKey = String(chatId ?? "");
+
+      // Very small command set: /status /halt /reset /help. Anything else is
+      // treated as a free-form chat turn and routed through the LLM.
+      if (text === "/help") {
+        void sendTelegramAlert(
+          "Help",
+          [
+            "/status - latest equity and positions",
+            "/halt - close all positions, halt trading 6h",
+            "/reset - clear our chat history",
+            "Anything else: I'll reply as Tradio with live portfolio context.",
+          ],
+          chatKey,
+        );
+        continue;
+      }
+
+      if (text === "/reset") {
+        telegramHistory.delete(chatKey);
+        void sendTelegramAlert("Chat reset", ["History cleared."], chatKey);
+        continue;
+      }
+
+      if (text === "/status") {
+        const latest = await prisma.portfolioSize.findFirst({ orderBy: { createdAt: "desc" }, select: { netPortfolio: true, createdAt: true, modelId: true } });
+        const positions = positionsCache.map((p) => `${p.symbol} ${p.side} size=${p.size} @${p.entryPrice}`);
+        void sendTelegramAlert(
+          "Status",
+          [
+            latest ? `Equity: $${Number(latest.netPortfolio).toFixed(2)} @ ${latest.createdAt.toISOString()}` : "No portfolio data",
+            positions.length ? `Positions: ${positions.join("; ")}` : "Positions: none",
+          ],
+          String(chatId ?? ""),
+        );
+        continue;
+      }
+
+      if (text === "/halt") {
+        try {
+          const model = await prisma.models.findFirst();
+          if (model) {
+            await prisma.riskHaltEvent.create({
+              data: {
+                modelId: model.id,
+                type: "MANUAL" as any,
+                clearsAt: new Date(Date.now() + 6 * 60 * 60 * 1000),
+                payload: JSON.stringify({ reason: "telegram /halt", from }),
+              },
+            });
+          }
+          void sendTelegramAlert("Halt placed", ["Trading halted for 6h (manual via Telegram)."], String(chatId ?? ""));
+        } catch (err) {
+          console.error("/halt failed:", (err as Error).message);
+          void sendTelegramAlert("Halt failed", [(err as Error).message], String(chatId ?? ""));
+        }
+        continue;
+      }
+
+      // Not a known slash command — treat as free-form chat with live context.
+      handleTelegramFreeText(chatKey, text).catch((err) =>
+        console.error(`[telegram] freetext handler crashed:`, (err as Error).message),
+      );
+    }
+  } catch (err) {
+    console.error("telegram poll error:", (err as Error).message);
+  } finally {
+    telegramPollLock = false;
+  }
+}
+
+function streamSnapshot(): string {
+  return JSON.stringify({
+    positions: positionsCache,
+    positionsUpdatedAt: positionsLastUpdated,
+    marketPrices: marketPricesCache,
+    marketPricesUpdatedAt: marketPricesLastUpdated,
+    ts: new Date().toISOString(),
+  });
+}
+
+function broadcast(event: string, payload: string): void {
+  const message = `event: ${event}\ndata: ${payload}\n\n`;
+  for (const client of streamClients) {
+    try {
+      client.write(message);
+    } catch {
+      streamClients.delete(client);
+    }
+  }
+}
+
+app.get("/stream", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+  streamClients.add(res);
+  res.write(`event: snapshot\ndata: ${streamSnapshot()}\n\n`);
+  req.on("close", () => {
+    streamClients.delete(res);
+  });
 });
+
+// Background refresher: keeps the caches warm and pushes a new snapshot to
+// every connected SSE client whenever anything changes. Cadence is well
+// below Lighter's rate-limit ceiling — the auth.ts token bucket protects it
+// either way.
+setInterval(() => {
+  Promise.all([
+    refreshPositions().catch((err) =>
+      console.error("bg refresh positions:", (err as Error).message),
+    ),
+    refreshMarketPrices().catch((err) =>
+      console.error("bg refresh prices:", (err as Error).message),
+    ),
+    pollTelegram().catch((err) =>
+      console.error("bg poll telegram:", (err as Error).message),
+    ),
+  ]).then(() => {
+    if (streamClients.size > 0) {
+      broadcast("snapshot", streamSnapshot());
+    }
+  });
+}, 3000);
+
+// Heartbeat: keep SSE connections alive through proxies that drop idle
+// connections after ~60s of silence.
+setInterval(() => {
+  for (const client of streamClients) {
+    try {
+      client.write(": ping\n\n");
+    } catch {
+      streamClients.delete(client);
+    }
+  }
+}, 25_000);
+
+const PORT = Number(process.env.PORT ?? 3001);
+let server: ReturnType<typeof app.listen> | null = null;
+
+function startServer() {
+  try {
+    server = app.listen(PORT, () => {
+      console.log(`Server is running on port ${PORT}`);
+    });
+    server.on("error", (err) => {
+      console.error(`Failed to bind port ${PORT}:`, err);
+      try { server?.close(); } catch {}
+    });
+  } catch (err) {
+    console.error(`Failed to start server on port ${PORT}:`, (err as Error).message);
+  }
+}
+
+startServer();
